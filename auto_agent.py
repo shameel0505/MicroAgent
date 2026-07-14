@@ -51,9 +51,21 @@ def execute(args):
 ```
 The moment you write this file, the system will dynamically load it and you can immediately use it on your next turn!
 
-IMPORTANT INSTRUCTIONS:
-- You must THINK and PLAN your steps carefully.
-- If you use a tool, you will receive the result in the next turn.
+[HOW TO USE TOOLS - CRITICAL]
+You MUST use the ReAct (Reason + Act) framework. To use a tool, you MUST output a markdown JSON block containing exactly "tool" and "arguments" keys.
+Example:
+```json
+{
+  "tool": "search_web",
+  "arguments": {
+    "query": "MSFT stock price"
+  }
+}
+```
+Our system will parse this block, execute the tool, and return the observation. You must then wait for the observation. DO NOT output the tool execution result yourself.
+
+AVAILABLE TOOLS:
+{TOOLS_JSON}
 """
 
 BASE_TOOLS = [
@@ -320,12 +332,11 @@ def compress_context(messages):
     compressed.extend(messages[-10:])
     return compressed
 
-def chat_with_ollama(messages, tools):
+def chat_with_ollama(messages):
     url = "http://localhost:11434/api/chat"
     payload = {
         "model": "qwen2.5-coder:7b",
         "messages": messages,
-        "tools": tools,
         "stream": False,
         "options": {"temperature": 0.0, "num_ctx": 16384}
     }
@@ -396,42 +407,58 @@ def main():
         for name, plugin in current_plugins.items():
             active_tools.append(plugin.TOOL_SCHEMA)
             
-        messages[0]["content"] = SYSTEM_PROMPT
+        messages[0]["content"] = SYSTEM_PROMPT.replace("{TOOLS_JSON}", json.dumps(active_tools, indent=2))
         messages.append({"role": "user", "content": user_input})
         
         while True:
             messages = compress_context(messages)
             
             with Status("[bold yellow]🤖 Agent thinking...[/bold yellow]", spinner="dots", console=console):
-                message = chat_with_ollama(messages, active_tools)
+                message = chat_with_ollama(messages)
             
             messages.append(message)
             
-            if message.get("content"):
-                console.print(Markdown(message["content"]))
+            reply_text = message.get("content", "")
+            if reply_text:
+                console.print(Markdown(reply_text))
                 
-            if "tool_calls" in message and message["tool_calls"]:
-                for tool_call in message["tool_calls"]:
-                    tool_name = tool_call["function"]["name"]
-                    try:
-                        args = tool_call["function"]["arguments"]
-                    except Exception as e:
-                        args = {}
+            # Aggressive ReAct regex extractor
+            json_blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
+            if not json_blocks:
+                # Fallback: look for raw JSON not in a markdown block if it looks like a tool
+                raw_match = re.search(r'(\{\s*(?:"tool"|"name")\s*:.*?\})', reply_text, re.DOTALL)
+                if raw_match:
+                    json_blocks = [raw_match.group(1)]
+                    
+            tool_executed = False
+            for block in json_blocks:
+                try:
+                    tool_call = json.loads(block.strip())
+                    tool_name = tool_call.get("tool") or tool_call.get("name")
+                    if tool_name and "arguments" in tool_call:
+                        args = tool_call["arguments"]
+                        if not isinstance(args, dict):
+                            args = {}
+                            
+                        console.print(Panel(f"[bold cyan]🔧 Executing Tool: {tool_name}[/bold cyan]\n[dim]{json.dumps(args, indent=2)}[/dim]"))
                         
-                    console.print(Panel(f"[bold cyan]🔧 Executing Tool: {tool_name}[/bold cyan]\n[dim]{json.dumps(args, indent=2)}[/dim]"))
-                    
-                    observation = execute_tool(tool_name, args, current_plugins)
-                    
-                    if messages and messages[-1].get("content") == observation:
-                        observation += "\n\n[SYSTEM WARNING: You are caught in an infinite loop repeating the exact same error. Use a completely different approach.]"
+                        observation = execute_tool(tool_name, args, current_plugins)
                         
-                    console.print(Panel(f"[bold green]👁️  Observation:[/bold green]\n{str(observation)[:1000]}...\n"))
+                        if messages and messages[-1].get("content") == observation:
+                            observation += "\n\n[SYSTEM WARNING: You are caught in an infinite loop repeating the exact same error. Use a completely different approach.]"
+                            
+                        console.print(Panel(f"[bold green]👁️  Observation:[/bold green]\n{str(observation)[:1000]}...\n"))
+                        
+                        messages.append({
+                            "role": "user",
+                            "content": f"Tool observation:\n{observation}\n\nWhat next?"
+                        })
+                        tool_executed = True
+                        break # Only execute first valid tool call
+                except Exception as e:
+                    pass
                     
-                    messages.append({
-                        "role": "tool",
-                        "content": observation
-                    })
-            else:
+            if not tool_executed:
                 break
 
 if __name__ == '__main__':
