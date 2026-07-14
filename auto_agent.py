@@ -60,12 +60,16 @@ The moment you write this file, the system will dynamically load it and you can 
 
 [HOW TO USE TOOLS - CRITICAL]
 You MUST use the ReAct (Reason + Act) framework. To use a tool, you MUST output a markdown JSON block containing exactly "tool" and "arguments" keys.
+CRITICAL JSON RULES:
+1. You CANNOT use Python-style triple quotes (`"""`) inside JSON values. JSON only supports standard double quotes (`"`).
+2. If you need to pass multi-line code, you MUST escape newlines as `\n` inside a single string.
+
 Example:
 ```json
 {
-  "tool": "search_web",
+  "tool": "execute_python",
   "arguments": {
-    "query": "MSFT stock price"
+    "code": "print('Hello')\nprint('World')"
   }
 }
 ```
@@ -439,6 +443,7 @@ def main():
                         json_blocks = [raw_match.group(1)]
                         
                 tool_executed = False
+                json_error = None
                 for block in json_blocks:
                     try:
                         tool_call = json.loads(block.strip())
@@ -475,9 +480,14 @@ def main():
                             
                             break # Only execute first valid tool call
                     except Exception as e:
-                        pass
+                        json_error = str(e)
                         
                 if not tool_executed:
+                    if json_error:
+                        error_msg = f"Failed to parse your JSON tool call: {json_error}. Remember: You CANNOT use triple quotes (\\\"\\\"\\\") in JSON. You must use standard double quotes and escape newlines using \\n."
+                        console.print(Panel(f"[bold red]JSON Parse Error:[/bold red]\n{error_msg}"))
+                        messages.append({"role": "user", "content": f"System Error: {error_msg}\n\nPlease correct your JSON formatting and try again."})
+                        continue # Loop again to let the agent fix it
                     break
         except KeyboardInterrupt:
             console.print("\n[bold red]🛑 Agent interrupted by user! Returning to chat...[/bold red]")
