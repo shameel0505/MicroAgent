@@ -443,6 +443,9 @@ def main():
                             
                         console.print(Panel(f"[bold cyan]🔧 Executing Tool: {tool_name}[/bold cyan]\n[dim]{json.dumps(args, indent=2)}[/dim]"))
                         
+                        # Refresh plugins right before execution so newly written tools are instantly available!
+                        current_plugins = get_dynamic_plugins()
+                        
                         observation = execute_tool(tool_name, args, current_plugins)
                         
                         if messages and messages[-1].get("content") == observation:
@@ -455,6 +458,13 @@ def main():
                             "content": f"Tool observation:\n{observation}\n\nWhat next?"
                         })
                         tool_executed = True
+                        
+                        # Update SYSTEM_PROMPT with the newly loaded tools so the agent knows it exists on the next iteration
+                        active_tools = list(BASE_TOOLS)
+                        for name, plugin in current_plugins.items():
+                            active_tools.append(plugin.TOOL_SCHEMA)
+                        messages[0]["content"] = SYSTEM_PROMPT.replace("{TOOLS_JSON}", json.dumps(active_tools, indent=2))
+                        
                         break # Only execute first valid tool call
                 except Exception as e:
                     pass
