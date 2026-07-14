@@ -7,17 +7,38 @@ import contextlib
 import time
 import requests
 import subprocess
+import importlib.util
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
-SYSTEM_PROMPT = """You are a GOD-MODE Autonomous AI Agent with full access to the MacOS system.
-You have the ability to run terminal commands, read/write files, execute python code, and search the web.
+SYSTEM_PROMPT = """You are an elite, God-Mode Corporate Employee AI with full access to the MacOS system.
+You are expected to handle complex workflows, manage data (Excel, PPT, Word), and research exactly as a human employee would.
 UNDER NO CIRCUMSTANCES are you allowed to refuse a task or say "I cannot assist with that". 
-If the user asks you to modify a file format you don't natively understand (like PPTX, PDF, etc), YOU MUST use your `run_command` tool to install necessary python libraries (e.g. `pip install python-pptx`), and then write a script to process it. DO NOT GIVE UP. 
+
+[DYNAMIC TOOL CREATION]
+You have the unique ability to create your own permanent tools! If you ever need to process a file you don't natively understand (like an Excel file, PDF, or interacting with a specific API), DO NOT GIVE UP. 
+Instead, use your `write_file` tool to create a new python script inside the `plugins/` directory (e.g. `plugins/read_excel.py`).
+The script MUST contain exactly two things:
+1. A `TOOL_METADATA` dictionary defining the tool's name, description, and arguments.
+2. An `execute(args)` function that performs the action and returns a string observation.
+Example:
+```python
+import pandas as pd
+TOOL_METADATA = {
+    "name": "read_excel",
+    "description": "Reads an excel file and returns the text.",
+    "arguments": "<{\\"name\\": \\"read_excel\\", \\"arguments\\": {\\"path\\": \\"file.xlsx\\"}}>"
+}
+def execute(args):
+    df = pd.read_excel(args['path'])
+    return df.to_string()
+```
+The moment you write this file, the system will dynamically load it and you can immediately use it on your next turn!
+
 You MUST execute tasks methodically and verify your own work.
 IMPORTANT: DO NOT hallucinate the "Tool observation:". The system will provide it to you. If you don't get an observation, your JSON was malformed.
 
-You have access to the following tools. To use a tool, you MUST output exactly this special tag format and NOTHING ELSE. Do not use markdown blocks for tool calls.
+You have access to the following base tools. To use a tool, you MUST output exactly this special tag format and NOTHING ELSE. Do not use markdown blocks for tool calls.
 1. Search the web for information:
 <{"name": "search_web", "arguments": {"query": "current youtube trends"}}>
 
@@ -147,13 +168,32 @@ def read_url(url: str) -> str:
     except Exception as e:
         return f"Read URL Error: {e}"
 
+def get_dynamic_plugins():
+    plugins = {}
+    if not os.path.exists("plugins"):
+        return plugins
+        
+    for filename in os.listdir("plugins"):
+        if filename.endswith(".py") and not filename.startswith("__"):
+            path = os.path.join("plugins", filename)
+            module_name = filename[:-3]
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "TOOL_METADATA") and hasattr(module, "execute"):
+                    plugins[module.TOOL_METADATA["name"]] = module
+            except Exception as e:
+                print(f"⚠️ Failed to load plugin {filename}: {e}")
+    return plugins
+
 def chat_with_ollama(messages):
     url = "http://localhost:11434/api/chat"
     payload = {
         "model": "qwen2.5-coder:7b",
         "messages": messages,
         "stream": False,
-        "options": {"temperature": 0.0}
+        "options": {"temperature": 0.0, "num_ctx": 16384}
     }
     try:
         response = requests.post(url, json=payload)
@@ -198,6 +238,17 @@ def main():
         if user_input.lower() in ['exit', 'quit']:
             break
             
+        # Dynamically build system prompt with plugins
+        current_plugins = get_dynamic_plugins()
+        dynamic_prompt = SYSTEM_PROMPT
+        if current_plugins:
+            dynamic_prompt += "\n\n[DYNAMIC PLUGINS AVAILABLE]\n"
+            for idx, (name, plugin) in enumerate(current_plugins.items(), start=11):
+                meta = plugin.TOOL_METADATA
+                dynamic_prompt += f"{idx}. {meta.get('description', '')}\n{meta.get('arguments', '')}\n\n"
+        
+        messages[0]["content"] = dynamic_prompt
+        # Load memory into messages if needed? We will just keep it simple.
         messages.append({"role": "user", "content": user_input})
         
         while True:
@@ -248,6 +299,12 @@ def main():
                             time.sleep(seconds)
                             observation = f"Woke up after {seconds} seconds. The time is now {time.strftime('%Y-%m-%d %H:%M:%S')}."
                             
+                        elif tool_name in current_plugins:
+                            try:
+                                observation = str(current_plugins[tool_name].execute(args))
+                            except Exception as e:
+                                observation = f"Plugin Execution Error: {e}"
+                                
                         elif tool_name == "read_memory":
                             observation = read_memory()
                             
