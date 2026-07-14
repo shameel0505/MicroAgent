@@ -42,6 +42,12 @@ You have access to the following tools. To use a tool, you MUST output exactly t
 8. Sleep/Wait for a specified number of seconds before continuing (use this to pause your 24/7 loop if you are waiting for an event):
 <{"name": "sleep", "arguments": {"seconds": 60}}>
 
+9. Read from your long-term memory (returns a JSON dictionary of all your saved facts):
+<{"name": "read_memory", "arguments": {}}>
+
+10. Save a fact to your long-term memory (key-value pair):
+<{"name": "write_memory", "arguments": {"key": "user_preference", "value": "User likes concise answers"}}>
+
 If you output a tool call, you must wait for the observation before continuing.
 """
 
@@ -84,6 +90,31 @@ def list_dir(path: str) -> str:
         return "\n".join(items) if items else "Directory is empty."
     except Exception as e:
         return f"List Dir Error: {e}"
+
+def read_memory() -> str:
+    if not os.path.exists("agent_memory.json"):
+        return "{}"
+    try:
+        with open("agent_memory.json", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Memory Read Error: {e}"
+
+def write_memory(key: str, value: str) -> str:
+    memory = {}
+    if os.path.exists("agent_memory.json"):
+        try:
+            with open("agent_memory.json", "r", encoding="utf-8") as f:
+                memory = json.load(f)
+        except:
+            pass
+    memory[key] = value
+    try:
+        with open("agent_memory.json", "w", encoding="utf-8") as f:
+            json.dump(memory, f, indent=4)
+        return f"Successfully saved '{key}' to memory."
+    except Exception as e:
+        return f"Memory Write Error: {e}"
 
 def search_web(query: str) -> str:
     try:
@@ -216,6 +247,12 @@ def main():
                             print(f"💤 Agent went to sleep for {seconds} seconds...")
                             time.sleep(seconds)
                             observation = f"Woke up after {seconds} seconds. The time is now {time.strftime('%Y-%m-%d %H:%M:%S')}."
+                            
+                        elif tool_name == "read_memory":
+                            observation = read_memory()
+                            
+                        elif tool_name == "write_memory":
+                            observation = write_memory(args.get("key"), args.get("value"))
                             
                         else:
                             observation = f"Error: Unknown tool {tool_name}"
