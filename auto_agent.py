@@ -411,66 +411,71 @@ def main():
         messages[0]["content"] = SYSTEM_PROMPT.replace("{TOOLS_JSON}", json.dumps(active_tools, indent=2))
         messages.append({"role": "user", "content": user_input})
         
-        while True:
-            messages = compress_context(messages)
-            
-            with Status("[bold yellow]🤖 Agent thinking...[/bold yellow]", spinner="dots", console=console):
-                message = chat_with_ollama(messages)
-            
-            messages.append(message)
-            
-            reply_text = message.get("content", "")
-            if reply_text:
-                console.print(Markdown(reply_text))
+        try:
+            while True:
+                messages = compress_context(messages)
                 
-            # Aggressive ReAct regex extractor
-            json_blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
-            if not json_blocks:
-                # Fallback: look for raw JSON not in a markdown block if it looks like a tool
-                raw_match = re.search(r'(\{\s*(?:"tool"|"name")\s*:.*?\})', reply_text, re.DOTALL)
-                if raw_match:
-                    json_blocks = [raw_match.group(1)]
+                with Status("[bold yellow]🤖 Agent thinking...[/bold yellow]", spinner="dots", console=console):
+                    message = chat_with_ollama(messages)
+                
+                messages.append(message)
+                
+                reply_text = message.get("content", "")
+                if reply_text:
+                    console.print(Markdown(reply_text))
                     
-            tool_executed = False
-            for block in json_blocks:
-                try:
-                    tool_call = json.loads(block.strip())
-                    tool_name = tool_call.get("tool") or tool_call.get("name")
-                    if tool_name and "arguments" in tool_call:
-                        args = tool_call["arguments"]
-                        if not isinstance(args, dict):
-                            args = {}
+                # Aggressive ReAct regex extractor
+                json_blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
+                if not json_blocks:
+                    # Fallback: look for raw JSON not in a markdown block if it looks like a tool
+                    raw_match = re.search(r'(\{\s*(?:"tool"|"name")\s*:.*?\})', reply_text, re.DOTALL)
+                    if raw_match:
+                        json_blocks = [raw_match.group(1)]
+                        
+                tool_executed = False
+                for block in json_blocks:
+                    try:
+                        tool_call = json.loads(block.strip())
+                        tool_name = tool_call.get("tool") or tool_call.get("name")
+                        if tool_name and "arguments" in tool_call:
+                            args = tool_call["arguments"]
+                            if not isinstance(args, dict):
+                                args = {}
+                                
+                            console.print(Panel(f"[bold cyan]🔧 Executing Tool: {tool_name}[/bold cyan]\n[dim]{json.dumps(args, indent=2)}[/dim]"))
                             
-                        console.print(Panel(f"[bold cyan]🔧 Executing Tool: {tool_name}[/bold cyan]\n[dim]{json.dumps(args, indent=2)}[/dim]"))
-                        
-                        # Refresh plugins right before execution so newly written tools are instantly available!
-                        current_plugins = get_dynamic_plugins()
-                        
-                        observation = execute_tool(tool_name, args, current_plugins)
-                        
-                        if messages and messages[-1].get("content") == observation:
-                            observation += "\n\n[SYSTEM WARNING: You are caught in an infinite loop repeating the exact same error. Use a completely different approach.]"
+                            # Refresh plugins right before execution so newly written tools are instantly available!
+                            current_plugins = get_dynamic_plugins()
                             
-                        console.print(Panel(f"[bold green]👁️  Observation:[/bold green]\n{str(observation)[:1000]}...\n"))
+                            observation = execute_tool(tool_name, args, current_plugins)
+                            
+                            expected_prev_obs = f"Tool observation:\n{observation}\n\nWhat next?"
+                            if len(messages) >= 2 and messages[-2].get("content") == expected_prev_obs:
+                                observation += "\n\n[SYSTEM WARNING: INFINITE LOOP DETECTED. You just executed the exact same tool with the exact same arguments and got the exact same error. DO NOT REPEAT THIS ACTION. You must either use `write_file` to fix the plugin, or verify the file path.]"
+                                
+                            console.print(Panel(f"[bold green]👁️  Observation:[/bold green]\n{str(observation)[:1000]}...\n"))
+                            
+                            messages.append({
+                                "role": "user",
+                                "content": f"Tool observation:\n{observation}\n\nWhat next?"
+                            })
+                            tool_executed = True
+                            
+                            # Update SYSTEM_PROMPT with the newly loaded tools so the agent knows it exists on the next iteration
+                            active_tools = list(BASE_TOOLS)
+                            for name, plugin in current_plugins.items():
+                                active_tools.append(plugin.TOOL_SCHEMA)
+                            messages[0]["content"] = SYSTEM_PROMPT.replace("{TOOLS_JSON}", json.dumps(active_tools, indent=2))
+                            
+                            break # Only execute first valid tool call
+                    except Exception as e:
+                        pass
                         
-                        messages.append({
-                            "role": "user",
-                            "content": f"Tool observation:\n{observation}\n\nWhat next?"
-                        })
-                        tool_executed = True
-                        
-                        # Update SYSTEM_PROMPT with the newly loaded tools so the agent knows it exists on the next iteration
-                        active_tools = list(BASE_TOOLS)
-                        for name, plugin in current_plugins.items():
-                            active_tools.append(plugin.TOOL_SCHEMA)
-                        messages[0]["content"] = SYSTEM_PROMPT.replace("{TOOLS_JSON}", json.dumps(active_tools, indent=2))
-                        
-                        break # Only execute first valid tool call
-                except Exception as e:
-                    pass
-                    
-            if not tool_executed:
-                break
+                if not tool_executed:
+                    break
+        except KeyboardInterrupt:
+            console.print("\n[bold red]🛑 Agent interrupted by user! Returning to chat...[/bold red]")
+            messages.append({"role": "system", "content": "[SYSTEM WARNING: The user forcibly interrupted your thought process.]"})
 
 if __name__ == '__main__':
     main()
