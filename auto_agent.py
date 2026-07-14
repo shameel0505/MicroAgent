@@ -61,7 +61,7 @@ The moment you write this file, the system will dynamically load it and you can 
 [HOW TO USE TOOLS - CRITICAL]
 You MUST use the ReAct (Reason + Act) framework. To use a tool, you MUST output a markdown JSON block containing exactly "tool" and "arguments" keys.
 CRITICAL JSON RULES:
-1. You CANNOT use Python-style triple quotes (`"""`) inside JSON values. JSON only supports standard double quotes (`"`).
+1. You CANNOT use Python-style triple quotes ('\"\"\"') inside JSON values. JSON only supports standard double quotes ('\"').
 2. If you need to pass multi-line code, you MUST escape newlines as `\n` inside a single string.
 
 Example:
