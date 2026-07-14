@@ -484,9 +484,28 @@ def main():
                         
                 if not tool_executed:
                     if json_error:
-                        error_msg = f"Failed to parse your JSON tool call: {json_error}. Remember: You CANNOT use triple quotes (\\\"\\\"\\\") in JSON. You must use standard double quotes and escape newlines using \\n."
-                        console.print(Panel(f"[bold red]JSON Parse Error:[/bold red]\n{error_msg}"))
-                        messages.append({"role": "user", "content": f"System Error: {error_msg}\n\nPlease correct your JSON formatting and try again."})
+                        error_msg = f"Failed to parse your JSON tool call: {json_error}. You MUST use standard double quotes for JSON keys/values, and you MUST escape double quotes INSIDE your strings using \\\"."
+                        
+                        # Infinite loop detection for JSON parse errors
+                        if len(messages) >= 2 and "System Error: Failed to parse your JSON tool call" in messages[-1].get("content", ""):
+                            loop_count = messages[-1].get("json_loop_count", 1) + 1
+                            if loop_count >= 3:
+                                console.print("\n[bold red]🛑 Agent stuck in JSON parse loop! Returning to chat...[/bold red]")
+                                messages.append({"role": "system", "content": "[SYSTEM WARNING: You failed to write valid JSON 3 times in a row. Stop trying to execute that specific code.]"})
+                                break
+                                
+                            messages.append({
+                                "role": "user", 
+                                "content": f"System Error: {error_msg}\n\nCRITICAL: You failed to format JSON {loop_count} times. You MUST escape internal double quotes like \\\" and escape newlines like \\n.",
+                                "json_loop_count": loop_count
+                            })
+                        else:
+                            console.print(Panel(f"[bold red]JSON Parse Error:[/bold red]\n{error_msg}"))
+                            messages.append({
+                                "role": "user", 
+                                "content": f"System Error: {error_msg}\n\nPlease correct your JSON formatting and try again.",
+                                "json_loop_count": 1
+                            })
                         continue # Loop again to let the agent fix it
                     break
         except KeyboardInterrupt:
