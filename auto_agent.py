@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import re
 import io
 import contextlib
 import time
@@ -11,23 +10,40 @@ import importlib.util
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.status import Status
+
+console = Console()
+
 SYSTEM_PROMPT = """You are an elite, God-Mode Corporate Employee AI with full access to the MacOS system.
-You are expected to handle complex workflows, manage data (Excel, PPT, Word), and research exactly as a human employee would.
+You are expected to handle complex workflows, manage data, and research exactly as a human employee would.
 UNDER NO CIRCUMSTANCES are you allowed to refuse a task or say "I cannot assist with that". 
 
 [DYNAMIC TOOL CREATION]
 You have the unique ability to create your own permanent tools! If you ever need to process a file you don't natively understand (like an Excel file, PDF, or interacting with a specific API), DO NOT GIVE UP. 
 Instead, use your `write_file` tool to create a new python script inside the `plugins/` directory (e.g. `plugins/read_excel.py`).
 The script MUST contain exactly two things:
-1. A `TOOL_METADATA` dictionary defining the tool's name, description, and arguments.
+1. A `TOOL_SCHEMA` dictionary defining the OpenAI-compatible tool schema.
 2. An `execute(args)` function that performs the action and returns a string observation.
-Example:
+
+Example `plugins/read_excel.py`:
 ```python
 import pandas as pd
-TOOL_METADATA = {
-    "name": "read_excel",
-    "description": "Reads an excel file and returns the text.",
-    "arguments": "<{\\"name\\": \\"read_excel\\", \\"arguments\\": {\\"path\\": \\"file.xlsx\\"}}>"
+TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "read_excel",
+        "description": "Reads an excel file and returns the text.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the excel file"}
+            },
+            "required": ["path"]
+        }
+    }
 }
 def execute(args):
     df = pd.read_excel(args['path'])
@@ -35,42 +51,153 @@ def execute(args):
 ```
 The moment you write this file, the system will dynamically load it and you can immediately use it on your next turn!
 
-You MUST execute tasks methodically and verify your own work.
-IMPORTANT: DO NOT hallucinate the "Tool observation:". The system will provide it to you. If you don't get an observation, your JSON was malformed.
-
-You have access to the following base tools. To use a tool, you MUST output exactly this special tag format and NOTHING ELSE. Do not use markdown blocks for tool calls.
-1. Search the web for information:
-<{"name": "search_web", "arguments": {"query": "current youtube trends"}}>
-
-2. Read a webpage's text content:
-<{"name": "read_url", "arguments": {"url": "https://example.com"}}>
-
-3. Execute arbitrary Python code locally:
-<{"name": "execute_python", "arguments": {"code": "print('hello world')"}}>
-
-4. Run a terminal command on the MacOS system:
-<{"name": "run_command", "arguments": {"command": "ls -la"}}>
-
-5. Read a local file:
-<{"name": "read_file", "arguments": {"path": "/Users/shameel/Desktop/youtube/main.py"}}>
-
-6. Write to a local file (creates or overwrites):
-<{"name": "write_file", "arguments": {"path": "example.txt", "content": "hello world"}}>
-
-7. List directory contents:
-<{"name": "list_directory", "arguments": {"path": "./"}}>
-
-8. Sleep/Wait for a specified number of seconds before continuing (use this to pause your 24/7 loop if you are waiting for an event):
-<{"name": "sleep", "arguments": {"seconds": 60}}>
-
-9. Read from your long-term memory (returns a JSON dictionary of all your saved facts):
-<{"name": "read_memory", "arguments": {}}>
-
-10. Save a fact to your long-term memory (key-value pair):
-<{"name": "write_memory", "arguments": {"key": "user_preference", "value": "User likes concise answers"}}>
-
-If you output a tool call, you must wait for the observation before continuing.
+IMPORTANT INSTRUCTIONS:
+- You must THINK and PLAN your steps carefully.
+- If you use a tool, you will receive the result in the next turn.
 """
+
+BASE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web using DuckDuckGo",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": "Read the text content of a webpage",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to read"}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_python",
+            "description": "Execute arbitrary Python code locally and return the stdout",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "The python code to execute"}
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a terminal command on the MacOS system",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The bash command to execute"}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a local file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write text to a local file (creates or overwrites)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file"},
+                    "content": {"type": "string", "description": "The text content to write"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List the contents of a directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the directory"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sleep",
+            "description": "Sleep/Wait for a specified number of seconds before continuing (use this to pause your 24/7 loop if you are waiting for an event)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "integer", "description": "Number of seconds to sleep"}
+                },
+                "required": ["seconds"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_memory",
+            "description": "Read from your long-term memory (returns a JSON dictionary of all your saved facts)",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_memory",
+            "description": "Save a fact to your long-term memory (key-value pair)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "The key to save"},
+                    "value": {"type": "string", "description": "The value to save"}
+                },
+                "required": ["key", "value"]
+            }
+        }
+    }
+]
 
 def execute_python_code(code: str) -> str:
     output = io.StringIO()
@@ -155,13 +282,9 @@ def read_url(url: str) -> str:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Remove scripts, styles, etc.
         for element in soup(["script", "style", "nav", "footer", "header"]):
             element.decompose()
-            
         text = soup.get_text(separator='\n', strip=True)
-        # Truncate text so we don't blow up the context window
         if len(text) > 4000:
             text = text[:4000] + "...\n[Text truncated due to length]"
         return text
@@ -181,31 +304,62 @@ def get_dynamic_plugins():
                 spec = importlib.util.spec_from_file_location(module_name, path)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
-                if hasattr(module, "TOOL_METADATA") and hasattr(module, "execute"):
-                    plugins[module.TOOL_METADATA["name"]] = module
+                if hasattr(module, "TOOL_SCHEMA") and hasattr(module, "execute"):
+                    plugins[module.TOOL_SCHEMA["function"]["name"]] = module
             except Exception as e:
-                print(f"⚠️ Failed to load plugin {filename}: {e}")
+                console.print(f"[red]⚠️ Failed to load plugin {filename}: {e}[/red]")
     return plugins
 
-def chat_with_ollama(messages):
+def compress_context(messages):
+    """Compress context by keeping system prompt, and keeping only the last 10 messages."""
+    if len(messages) <= 12:
+        return messages
+    
+    compressed = [messages[0]]
+    compressed.append({"role": "system", "content": "[SYSTEM: Older conversation history has been compressed/truncated to save memory.]"})
+    compressed.extend(messages[-10:])
+    return compressed
+
+def chat_with_ollama(messages, tools):
     url = "http://localhost:11434/api/chat"
     payload = {
         "model": "qwen2.5-coder:7b",
         "messages": messages,
+        "tools": tools,
         "stream": False,
         "options": {"temperature": 0.0, "num_ctx": 16384}
     }
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
-        return response.json().get("message", {}).get("content", "")
+        return response.json().get("message", {})
     except Exception as e:
-        return f"Error communicating with Ollama: {e}"
+        return {"role": "assistant", "content": f"Error communicating with Ollama: {e}"}
+
+def execute_tool(tool_name, args, current_plugins):
+    if tool_name == "search_web": return search_web(args.get("query"))
+    if tool_name == "read_url": return read_url(args.get("url"))
+    if tool_name == "execute_python": return execute_python_code(args.get("code"))
+    if tool_name == "run_command": return run_terminal_command(args.get("command"))
+    if tool_name == "read_file": return read_local_file(args.get("path"))
+    if tool_name == "write_file": return write_local_file(args.get("path"), args.get("content"))
+    if tool_name == "list_directory": return list_dir(args.get("path"))
+    if tool_name == "sleep":
+        seconds = int(args.get("seconds", 60))
+        console.print(f"[bold blue]💤 Agent went to sleep for {seconds} seconds...[/bold blue]")
+        time.sleep(seconds)
+        return f"Woke up after {seconds} seconds. The time is now {time.strftime('%Y-%m-%d %H:%M:%S')}."
+    if tool_name == "read_memory": return read_memory()
+    if tool_name == "write_memory": return write_memory(args.get("key"), args.get("value"))
+    if tool_name in current_plugins:
+        try:
+            return str(current_plugins[tool_name].execute(args))
+        except Exception as e:
+            return f"Plugin Execution Error: {e}"
+    return f"Error: Unknown tool {tool_name}"
 
 def main():
-    print("====================================================")
-    print("🤖 YT AUTOMATION AGENT (Powered by Qwen2.5-Coder)")
-    print("====================================================\n")
+    console.print(Panel.fit("[bold magenta]🤖 YT AUTOMATION AGENT v2.0 (Claude-Level Architecture)[/bold magenta]\n[cyan]Powered by Qwen2.5-Coder & Native Tool Calling[/cyan]"))
     
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     
@@ -224,11 +378,10 @@ def main():
                     user_input = content
                     with open("inbox.txt", "w", encoding="utf-8") as f:
                         f.write("")
-                    print("\n[Task received from inbox.txt]")
+                    console.print("\n[bold green][Task received from inbox.txt][/bold green]")
                     break
             
             import select
-            # Wait 1 second for terminal input silently
             i, o, e = select.select([sys.stdin], [], [], 1)
             if i:
                 user_input = sys.stdin.readline().strip()
@@ -238,95 +391,48 @@ def main():
         if user_input.lower() in ['exit', 'quit']:
             break
             
-        # Dynamically build system prompt with plugins
         current_plugins = get_dynamic_plugins()
-        dynamic_prompt = SYSTEM_PROMPT
-        if current_plugins:
-            dynamic_prompt += "\n\n[DYNAMIC PLUGINS AVAILABLE]\n"
-            for idx, (name, plugin) in enumerate(current_plugins.items(), start=11):
-                meta = plugin.TOOL_METADATA
-                dynamic_prompt += f"{idx}. {meta.get('description', '')}\n{meta.get('arguments', '')}\n\n"
-        
-        messages[0]["content"] = dynamic_prompt
-        # Load memory into messages if needed? We will just keep it simple.
+        active_tools = list(BASE_TOOLS)
+        for name, plugin in current_plugins.items():
+            active_tools.append(plugin.TOOL_SCHEMA)
+            
+        messages[0]["content"] = SYSTEM_PROMPT
         messages.append({"role": "user", "content": user_input})
         
         while True:
-            print("🤖 Agent thinking...")
-            reply = chat_with_ollama(messages)
-            print(f"🤖 Agent: {reply}\n")
+            messages = compress_context(messages)
             
-            messages.append({"role": "assistant", "content": reply})
+            with Status("[bold yellow]🤖 Agent thinking...[/bold yellow]", spinner="dots", console=console):
+                message = chat_with_ollama(messages, active_tools)
             
-            # Check for tool call
-            if '<{"name":' in reply:
-                import re
-                match = re.search(r'<(\{\s*"name"\s*:.*?\})\s*>', reply, re.DOTALL)
-                if match:
-                    tool_call = match.group(1)
+            messages.append(message)
+            
+            if message.get("content"):
+                console.print(Markdown(message["content"]))
+                
+            if "tool_calls" in message and message["tool_calls"]:
+                for tool_call in message["tool_calls"]:
+                    tool_name = tool_call["function"]["name"]
                     try:
-                        tool_data = json.loads(tool_call)
-                        tool_name = tool_data.get("name")
-                        args = tool_data.get("arguments", {})
-                        
-                        print(f"🔧 Executing Tool: {tool_name}")
-                        observation = ""
-                        
-                        if tool_name == "search_web":
-                            observation = search_web(args.get("query"))
-                        
-                        elif tool_name == "read_url":
-                            observation = read_url(args.get("url"))
-                            
-                        elif tool_name == "execute_python":
-                            observation = execute_python_code(args.get("code"))
-                            
-                        elif tool_name == "run_command":
-                            observation = run_terminal_command(args.get("command"))
-                            
-                        elif tool_name == "read_file":
-                            observation = read_local_file(args.get("path"))
-                            
-                        elif tool_name == "write_file":
-                            observation = write_local_file(args.get("path"), args.get("content"))
-                            
-                        elif tool_name == "list_directory":
-                            observation = list_dir(args.get("path"))
-                            
-                        elif tool_name == "sleep":
-                            seconds = int(args.get("seconds", 60))
-                            print(f"💤 Agent went to sleep for {seconds} seconds...")
-                            time.sleep(seconds)
-                            observation = f"Woke up after {seconds} seconds. The time is now {time.strftime('%Y-%m-%d %H:%M:%S')}."
-                            
-                        elif tool_name in current_plugins:
-                            try:
-                                observation = str(current_plugins[tool_name].execute(args))
-                            except Exception as e:
-                                observation = f"Plugin Execution Error: {e}"
-                                
-                        elif tool_name == "read_memory":
-                            observation = read_memory()
-                            
-                        elif tool_name == "write_memory":
-                            observation = write_memory(args.get("key"), args.get("value"))
-                            
-                        else:
-                            observation = f"Error: Unknown tool {tool_name}"
-                            
+                        args = tool_call["function"]["arguments"]
                     except Exception as e:
-                        observation = f"Tool Execution Error: {e}"
+                        args = {}
                         
-                    # Check for infinite loops
-                    if messages and messages[-1].get("content", "").startswith(f"Tool observation:\n{observation}"):
-                        observation += "\n\n[SYSTEM WARNING: You are caught in an infinite loop repeating the exact same error. DO NOT try the exact same code again. Use a completely different approach.]"
+                    console.print(Panel(f"[bold cyan]🔧 Executing Tool: {tool_name}[/bold cyan]\n[dim]{json.dumps(args, indent=2)}[/dim]"))
                     
-                    print(f"👁️  Observation:\n{observation[:500]}...\n")
-                    messages.append({"role": "user", "content": f"Tool observation:\n{observation}\n\nWhat next?"})
-                else:
-                    break # Malformed tag
+                    observation = execute_tool(tool_name, args, current_plugins)
+                    
+                    if messages and messages[-1].get("content") == observation:
+                        observation += "\n\n[SYSTEM WARNING: You are caught in an infinite loop repeating the exact same error. Use a completely different approach.]"
+                        
+                    console.print(Panel(f"[bold green]👁️  Observation:[/bold green]\n{str(observation)[:1000]}...\n"))
+                    
+                    messages.append({
+                        "role": "tool",
+                        "content": observation
+                    })
             else:
-                break # No tool call found, agent is done with turn
+                break
 
 if __name__ == '__main__':
     main()
