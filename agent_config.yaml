@@ -1,0 +1,56 @@
+# ╔══════════════════════════════════════════════════════╗
+# ║    AutoAgent v3.0 — Config (Qwen 2.5 Coder 9B)     ║
+# ╚══════════════════════════════════════════════════════╝
+
+# ── Model ──────────────────────────────────────────────
+model: qwen2.5-coder:7b       # switch to :14b if you have the RAM
+context_size: 16384
+temperature: 0.0
+ollama_url: http://localhost:11434
+llm_retries: 3
+retry_delay: 2
+
+# ── Timeouts ───────────────────────────────────────────
+python_timeout: 30
+command_timeout: 30
+web_timeout: 15
+
+# ── Paths ──────────────────────────────────────────────
+workspace_dir: workspace
+plugins_dir: plugins
+
+# ── UX ─────────────────────────────────────────────────
+enable_streaming: true
+
+# ── Planning ───────────────────────────────────────────
+enable_planning: true
+planning_threshold: 80
+
+# ── Context — tuned for 7B/9B small models ─────────────
+# Small models lose coherence quickly with long histories.
+# Compress earlier and keep fewer recent messages.
+compress_threshold: 20
+keep_recent: 8               # was 10 — fewer recent messages = less noise
+enable_smart_compress: true
+
+# ── Tool output limits ─────────────────────────────────
+search_max_results: 5        # fewer results = less token noise
+file_read_limit: 6000        # generous but not overwhelming
+url_read_limit: 4000         # small models get lost in long web pages
+
+# ── Observation offloading ─────────────────────────────
+# Large tool outputs are saved to workspace/ and a short pointer
+# is given to the model instead.  Keeps context clean.
+observation_limit: 3000      # chars fed back to LLM
+offload_large_obs: true      # enable file-based offloading
+
+# ── Safety ─────────────────────────────────────────────
+max_steps: 30                # hard cap on ReAct steps per task
+max_json_retries: 3
+max_repeat_count: 2
+
+# ── Persistence ────────────────────────────────────────
+memory_file: agent_memory.json
+episodic_file: agent_episodic.json
+session_file: agent_session.json
+log_file: agent.log
