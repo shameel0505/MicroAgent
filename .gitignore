@@ -1,0 +1,25 @@
+# Virtual Environments
+qwen_venv/
+venv/
+env/
+.env
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Agent Runtime Files (Logs and Memory)
+agent.log
+agent_episodic.json
+agent_session.json
+agent_memory.json
+inbox.txt
+
+# Workspace outputs (auto-generated content)
+workspace/*
+!workspace/.gitkeep
+
+# macOS
+.DS_Store
