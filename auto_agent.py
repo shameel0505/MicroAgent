@@ -1021,9 +1021,9 @@ def main() -> None:
             # Refresh tool list (plugins may have changed between turns)
             active_tools = build_active_tools()
             tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
-            messages[0]["content"] = SYSTEM_PROMPT.replace(
+            messages[0]["content"] = SYSTEM_PROMPT_TEMPLATE.replace(
                 "{TOOLS_XML}", tools_xml_str
-            )
+            ).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
             messages.append({"role": "user", "content": user_input})
 
             try:
