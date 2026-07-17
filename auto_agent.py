@@ -146,28 +146,28 @@ logger = AgentLogger(CONFIG["log_file"])
 # Deliberately compact for small (7B/9B) models.
 # Long system prompts eat into the effective context window and cause
 # small models to lose focus. Keep it tight and example-driven.
-SYSTEM_PROMPT = """You are AutoAgent — an autonomous AI with full MacOS access. EXECUTE tasks; never tell the user to do them manually.
+SYSTEM_PROMPT_TEMPLATE = """You are AutoAgent — an autonomous AI with full MacOS access.
+You operate in a strict State Machine.
+Your current working directory is: {WORKSPACE_DIR}
 
-TOOL FORMAT — output a ```json block:
-```json
-{"tool": "tool_name", "arguments": {"key": "value"}}
-```
-JSON RULES (critical):
-- Double quotes only. No Python triple-quotes inside JSON.
-- Escape code newlines as \\n, internal quotes as \\".
-- Wait for OBSERVATION before the next tool call.
+[MANDATORY FORMAT]
+For EVERY turn, you MUST output your reasoning inside <thought>...</thought> tags first!
+After your thought, you must either output tool call(s) OR a transition tag.
 
-REASONING: Think step-by-step. State THOUGHT → ACTION → read OBSERVATION → repeat until done.
-On error: re-read the error carefully, try a different approach, never give up.
+[STATES]
+EVALUATE: Analyze the request and plan. Transition to RESEARCH or ACTION.
+RESEARCH: Gather info using read tools (search_web, read_url, read_file).
+SYNTHESIS: Write a compressed summary in <scratchpad>...</scratchpad> tags, then immediately <transition>ACTION</transition>.
+ACTION: Execute tasks to fulfill the goal using write tools (write_file, execute_python, run_command). Transition to DONE when finished.
 
-MEMORY:
-- read_memory / write_memory / search_memory → persistent key-value facts
-- read_episodic → past task summaries (check first on complex tasks)
-
-DYNAMIC TOOLS: write plugins/<name>.py with TOOL_SCHEMA dict + execute(args) fn → instantly available.
+[RULES]
+1. Use XML tool tags for ALL tool calls.
+2. If info is missing, RESEARCH. If ready to build/modify, ACTION.
+3. NEVER call a tool and transition in the same turn. Choose ONE.
+4. You may execute multiple independent tools in the same turn.
 
 AVAILABLE TOOLS:
-{TOOLS_JSON}
+{TOOLS_XML}
 """
 
 
@@ -176,82 +176,66 @@ AVAILABLE TOOLS:
 # ═══════════════════════════════════════════════════════
 
 BASE_TOOLS: List[Dict] = [
-    {"type": "function", "function": {
-        "name": "think",
-        "description": "Reason through a problem or make a plan before acting. No side effects.",
-        "parameters": {"type": "object",
-                       "properties": {"reasoning": {"type": "string", "description": "Your internal analysis or step-by-step plan."}},
-                       "required": ["reasoning"]}}},
-    {"type": "function", "function": {
+    {
         "name": "search_web",
-        "description": "Search the web via DuckDuckGo. Returns titles, URLs, and snippets.",
-        "parameters": {"type": "object",
-                       "properties": {"query": {"type": "string", "description": "Search query"}},
-                       "required": ["query"]}}},
-    {"type": "function", "function": {
+        "schema": "<search_web>\n<query>search query</query>\n</search_web>",
+        "description": "Search the web via DuckDuckGo. Returns titles, URLs, and snippets."
+    },
+    {
         "name": "read_url",
-        "description": "Fetch and extract readable text from a URL. Strips nav/ads, focuses on main content.",
-        "parameters": {"type": "object",
-                       "properties": {"url": {"type": "string", "description": "Full URL to fetch"}},
-                       "required": ["url"]}}},
-    {"type": "function", "function": {
+        "schema": "<read_url>\n<url>Full URL to fetch</url>\n</read_url>",
+        "description": "Fetch and extract readable text from a URL. Strips nav/ads, focuses on main content."
+    },
+    {
         "name": "execute_python",
-        "description": "Run Python code in a sandboxed subprocess. Returns stdout + stderr. CWD is workspace/.",
-        "parameters": {"type": "object",
-                       "properties": {"code": {"type": "string", "description": "Python code (escape newlines as \\n in JSON)"}},
-                       "required": ["code"]}}},
-    {"type": "function", "function": {
+        "schema": "<execute_python>\n# python code here\n</execute_python>",
+        "description": "Run Python code in a sandboxed subprocess. Returns stdout + stderr. CWD is workspace/."
+    },
+    {
         "name": "run_command",
-        "description": "Run a bash command on MacOS. Returns combined stdout + stderr.",
-        "parameters": {"type": "object",
-                       "properties": {"command": {"type": "string", "description": "Bash command to run"}},
-                       "required": ["command"]}}},
-    {"type": "function", "function": {
+        "schema": "<run_command>\nbash command here\n</run_command>",
+        "description": "Run a bash command on MacOS. Returns combined stdout + stderr."
+    },
+    {
         "name": "read_file",
-        "description": "Read a local file's contents (up to 8 000 chars). Good for code, text, JSON, CSV.",
-        "parameters": {"type": "object",
-                       "properties": {"path": {"type": "string", "description": "Absolute or relative file path"}},
-                       "required": ["path"]}}},
-    {"type": "function", "function": {
+        "schema": "<read_file>\n<path>absolute or relative file path</path>\n</read_file>",
+        "description": "Read a local file's contents (up to 8 000 chars). Good for code, text, JSON, CSV."
+    },
+    {
         "name": "write_file",
-        "description": "Write text to a local file. Creates missing directories. Overwrites if exists.",
-        "parameters": {"type": "object",
-                       "properties": {"path": {"type": "string", "description": "File path"},
-                                      "content": {"type": "string", "description": "Text content to write"}},
-                       "required": ["path", "content"]}}},
-    {"type": "function", "function": {
+        "schema": "<write_file>\n<path>file path</path>\n<content>text content to write</content>\n</write_file>",
+        "description": "Write text to a local file. Creates missing directories. Overwrites if exists."
+    },
+    {
         "name": "list_directory",
-        "description": "List files and subdirectories at a path, with sizes.",
-        "parameters": {"type": "object",
-                       "properties": {"path": {"type": "string", "description": "Directory path to list"}},
-                       "required": ["path"]}}},
-    {"type": "function", "function": {
+        "schema": "<list_directory>\n<path>directory path to list</path>\n</list_directory>",
+        "description": "List files and subdirectories at a path, with sizes."
+    },
+    {
         "name": "sleep",
-        "description": "Sleep for N seconds (use in polling/monitoring loops).",
-        "parameters": {"type": "object",
-                       "properties": {"seconds": {"type": "integer", "description": "Seconds to wait"}},
-                       "required": ["seconds"]}}},
-    {"type": "function", "function": {
+        "schema": "<sleep>\n<seconds>seconds to wait</seconds>\n</sleep>",
+        "description": "Sleep for N seconds (use in polling/monitoring loops)."
+    },
+    {
         "name": "read_memory",
-        "description": "Read all facts from persistent semantic memory (key-value store).",
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {
+        "schema": "<read_memory></read_memory>",
+        "description": "Read all facts from persistent semantic memory (key-value store)."
+    },
+    {
         "name": "write_memory",
-        "description": "Save a fact to persistent semantic memory. Survives across sessions.",
-        "parameters": {"type": "object",
-                       "properties": {"key": {"type": "string", "description": "Memory key/label"},
-                                      "value": {"type": "string", "description": "Value to remember"}},
-                       "required": ["key", "value"]}}},
-    {"type": "function", "function": {
+        "schema": "<write_memory>\n<key>Memory key/label</key>\n<value>Value to remember</value>\n</write_memory>",
+        "description": "Save a fact to persistent semantic memory. Survives across sessions."
+    },
+    {
         "name": "search_memory",
-        "description": "Search semantic memory for entries matching a text query.",
-        "parameters": {"type": "object",
-                       "properties": {"query": {"type": "string", "description": "Text to search across memory keys and values"}},
-                       "required": ["query"]}}},
-    {"type": "function", "function": {
+        "schema": "<search_memory>\n<query>Text to search</query>\n</search_memory>",
+        "description": "Search semantic memory for entries matching a text query."
+    },
+    {
         "name": "read_episodic",
-        "description": "Read summaries of past completed tasks from episodic memory.",
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
+        "schema": "<read_episodic></read_episodic>",
+        "description": "Read summaries of past completed tasks from episodic memory."
+    }
 ]
 
 # ═══════════════════════════════════════════════════════
@@ -599,68 +583,47 @@ def smart_compress(messages: List[Dict]) -> List[Dict]:
 # TOOL EXTRACTION  (multi-block, auto-repair)
 # ═══════════════════════════════════════════════════════
 
-def _repair_json(raw: str) -> Optional[Dict]:
-    """Multi-pass JSON repair for common small-model output mistakes."""
-    candidates = [raw]
-
-    # Pass 1: escape bare newlines inside strings
-    candidates.append(re.sub(r'(?<!\\)\n', r'\\n', raw))
-
-    # Pass 2: replace Python literals with JSON equivalents
-    py_fixed = re.sub(r'(?<!["\w])True(?!["\w])', 'true', raw)
-    py_fixed = re.sub(r'(?<!["\w])False(?!["\w])', 'false', py_fixed)
-    py_fixed = re.sub(r'(?<!["\w])None(?!["\w])', 'null', py_fixed)
-    candidates.append(py_fixed)
-
-    # Pass 3: single-quote → double-quote (only on key names and simple values)
-    sq_fixed = re.sub(r"'([^']*?)'", r'"\1"', raw)
-    candidates.append(sq_fixed)
-
-    # Pass 4: strip trailing commas before } or ]
-    tc_fixed = re.sub(r',\s*([}\]])', r'\1', raw)
-    candidates.append(tc_fixed)
-
-    # Pass 5: combined passes
-    combined = re.sub(r'(?<!\\)\n', r'\\n', tc_fixed)
-    combined = re.sub(r'(?<!["\w])True(?!["\w])', 'true', combined)
-    combined = re.sub(r'(?<!["\w])False(?!["\w])', 'false', combined)
-    combined = re.sub(r'(?<!["\w])None(?!["\w])', 'null', combined)
-    candidates.append(combined)
-
-    for candidate in candidates:
-        try:
-            return json.loads(candidate)
-        except (json.JSONDecodeError, Exception):
-            continue
-    return None
+def _parse_inner_args(inner_xml: str) -> Dict[str, str]:
+    args = {}
+    inner_matches = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)
+    if inner_matches:
+        for arg_name, arg_val in inner_matches:
+            args[arg_name] = arg_val.strip()
+    return args
 
 
 def extract_tool_calls(text: str) -> List[Tuple[str, Dict]]:
-    """Extract all valid tool calls from LLM response. Returns list of (name, args)."""
+    """Extract all valid XML tool calls from LLM response. Returns list of (name, args)."""
     calls: List[Tuple[str, Dict]] = []
-
-    # Primary: ```json { ... } ``` or ``` { ... } ```
-    blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-
-    # Fallback 1: bare JSON with "tool" key (model forgot the fences)
-    if not blocks:
-        blocks = [m.group(1) for m in re.finditer(r'(\{\s*"tool"\s*:.*?\})', text, re.DOTALL)]
-
-    # Fallback 2: bare JSON with "name" + "arguments" keys (older format)
-    if not blocks:
-        blocks = [m.group(1) for m in re.finditer(r'(\{\s*"name"\s*:.*?"arguments".*?\})', text, re.DOTALL)]
-
-    for raw in blocks:
-        data = _repair_json(raw.strip())
-        if data is None:
-            continue
-        tool_name = data.get("tool") or data.get("name")
-        args = data.get("arguments", {})
-        if not isinstance(args, dict):
-            args = {}
-        if tool_name:
-            calls.append((tool_name, args))
-
+    
+    # Match <tool_name>...</tool_name>
+    matches = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', text, re.DOTALL)
+    for name, inner_xml in matches:
+        if name in ("transition", "scratchpad", "thought"):
+            continue # Handled by state machine
+            
+        args = _parse_inner_args(inner_xml)
+        if not args:
+            # Fallback for single-arg tools where the inner content is the raw value
+            if name == "execute_python":
+                args["code"] = inner_xml.strip()
+            elif name == "run_command":
+                args["command"] = inner_xml.strip()
+            elif name == "search_web":
+                args["query"] = inner_xml.strip()
+            elif name == "read_url":
+                args["url"] = inner_xml.strip()
+            elif name == "read_file":
+                args["path"] = inner_xml.strip()
+            elif name == "list_directory":
+                args["path"] = inner_xml.strip()
+            elif name == "sleep":
+                args["seconds"] = inner_xml.strip()
+            elif name == "search_memory":
+                args["query"] = inner_xml.strip()
+                
+        calls.append((name, args))
+        
     return calls
 
 # ═══════════════════════════════════════════════════════
@@ -781,46 +744,18 @@ def _prepare_observation(tool_name: str, result: str) -> str:
         return result[:limit] + f"\n… [truncated at {limit} chars]"
 
 
-def react_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
-    """Execute one complete user turn through the ReAct loop."""
-
-    # Optional: auto-generate plan for complex tasks
-    if should_plan(user_input):
-        console.print("[dim]🗺  Generating execution plan...[/dim]")
-        plan = make_plan(user_input)
-        if plan:
-            console.print(Panel(plan, title="[bold cyan]🗺  Execution Plan[/bold cyan]",
-                                border_style="cyan"))
-            # Inject plan as a user message (not system) — Qwen follows user turns better
-            messages.append({
-                "role": "user",
-                "content": f"Before you start, here is a suggested plan:\n{plan}\nNow execute it step by step.",
-            })
-
-    json_error_count = 0
-    last_tool_sig: Optional[str] = None
-    repeat_count = 0
+def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
+    """Execute one complete user turn through the State Machine."""
+    
+    current_state = "EVALUATE"
     step = 0
     max_steps = CONFIG["max_steps"]
-
+    
     # ── Loop detection ─────────────────────────────────────────────────────
-    # Track how many times each exact (tool, args) pair has been called.
-    # This catches BOTH consecutive loops (A→A) AND alternating loops (A→B→A→B).
     tool_sig_counts: Counter = Counter()
-    # Track last N tool names for pattern detection
     recent_tools: deque = deque(maxlen=8)
-
-    # ── Progress enforcer ────────────────────────────────────────────
-    # Small models get stuck in research loops. If no concrete output
-    # (execute_python / write_file / run_command) is produced within
-    # MAX_RESEARCH_STEPS consecutive steps, we force action.
-    CONCRETE_TOOLS = {"execute_python", "write_file", "run_command"}
-    MAX_RESEARCH_STEPS = 4   # steps without concrete output before warning
-    steps_without_concrete = 0
-
-
+    
     while True:
-        # ── Hard step limit (prevents infinite loops in small models) ──
         step += 1
         if step > max_steps:
             console.print(f"[bold red]⛔ Max steps ({max_steps}) reached. Stopping.[/bold red]")
@@ -828,243 +763,140 @@ def react_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
                 "role": "system",
                 "content": f"[SYSTEM: Maximum step limit ({max_steps}) reached. Summarise what you accomplished and what remains.]",
             })
-            # One final LLM call for summary
             with console.status("[yellow]Generating summary...[/yellow]", spinner="dots"):
                 resp = chat_ollama_blocking(messages)
             summary = resp.get("content", "")
             if summary:
-                console.print(Panel(Markdown(summary),
-                                    title="[yellow]Task Summary[/yellow]",
-                                    border_style="yellow"))
+                console.print(Panel(Markdown(summary), title="[yellow]Task Summary[/yellow]", border_style="yellow"))
                 messages.append({"role": "assistant", "content": summary})
             break
-
-        # ── Compress if needed ──────────────────────────
-        messages = smart_compress(messages)
-
-        # ── Call LLM (streaming or blocking) ───────────
-        t0 = time.time()
+            
+        # Append state reminder explicitly
+        state_prompt = f"[SYSTEM: You are currently in STATE: {current_state}. Please think, act, and transition.]"
+        messages.append({"role": "user", "content": state_prompt})
+        
+        print_status(messages)
+        
         full_reply = ""
-
+        t0 = time.time()
+        
         if CONFIG["enable_streaming"]:
             with Live(console=console, refresh_per_second=10, transient=False) as live:
                 live.update(Panel("[dim]…[/dim]",
-                                  title=f"[bold yellow]🤖 Agent  [dim](step {step}/{max_steps})[/dim][/bold yellow]",
+                                  title=f"[bold yellow]🤖 Agent [dim]({current_state})[/dim][/bold yellow]",
                                   border_style="yellow"))
                 for chunk in stream_ollama(messages):
                     full_reply += chunk
-                    display = Markdown(full_reply) if len(full_reply) < 4000 else full_reply[-2000:]
+                    # Convert <thought> to visible markdown blockquotes
+                    visible_reply = full_reply.replace("<thought>", "> **💭 Thought:**\n> ").replace("</thought>", "\n")
+                    display = Markdown(visible_reply) if len(visible_reply) < 4000 else visible_reply[-2000:]
                     live.update(Panel(display,
-                                      title=f"[bold yellow]🤖 Agent  [dim](step {step}/{max_steps})[/dim][/bold yellow]",
+                                      title=f"[bold yellow]🤖 Agent [dim]({current_state})[/dim][/bold yellow]",
                                       border_style="yellow"))
         else:
-            with console.status(f"[yellow]🤖 Thinking… (step {step}/{max_steps})[/yellow]", spinner="dots"):
+            with console.status(f"[yellow]🤖 Thinking in {current_state}…[/yellow]", spinner="dots"):
                 resp = chat_ollama_blocking(messages)
                 full_reply = resp.get("content", "")
-            console.print(Panel(Markdown(full_reply),
-                                title=f"[bold yellow]🤖 Agent (step {step})[/bold yellow]",
+            visible_reply = full_reply.replace("<thought>", "> **💭 Thought:**\n> ").replace("</thought>", "\n")
+            console.print(Panel(Markdown(visible_reply),
+                                title=f"[bold yellow]🤖 Agent ({current_state})[/bold yellow]",
                                 border_style="yellow"))
-
+                                
         dur_llm = time.time() - t0
         logger.llm_call(dur_llm, estimate_tokens(full_reply))
         messages.append({"role": "assistant", "content": full_reply})
-
-        # ── Extract tool calls ──────────────────────────
+        
+        # Check for state transitions
+        transition_match = re.search(r'<transition>(.*?)</transition>', full_reply, re.IGNORECASE)
+        
+        # Extract and execute tools
         tool_calls = extract_tool_calls(full_reply)
+        
+        if not tool_calls and not transition_match:
+            # Model hallucinated or gave pure text without transition
+            messages.append({"role": "user", "content": "SYSTEM WARNING: No XML tool calls or <transition> tags found. You MUST use XML tags to act or transition."})
+            continue
 
-        if not tool_calls:
-            # Check if the model tried but produced bad JSON
-            attempted = bool(re.search(r'"tool"\s*:|```json', full_reply))
-            if attempted:
-                json_error_count += 1
-                if json_error_count >= CONFIG["max_json_retries"]:
-                    console.print("[red]⛔ JSON parse failed 3×. Returning to prompt.[/red]")
-                    messages.append({
-                        "role": "system",
-                        "content": "[SYSTEM: You failed to write valid JSON 3 times. Stop tool calls. Give your best answer in plain text.]",
-                    })
-                    break
-                # ── Small-model-specific error guidance ──
-                # Give a concrete mini-example to re-anchor the model
-                errmsg = (
-                    f"SYSTEM ERROR: Your JSON could not be parsed (attempt {json_error_count}/{CONFIG['max_json_retries']}).\n"
-                    "Common mistakes: single quotes, unescaped newlines, trailing commas, Python True/False/None.\n"
-                    "Correct format example:\n"
-                    '```json\n{"tool": "run_command", "arguments": {"command": "ls"}}\n```\n'
-                    "Try again with correct JSON."
-                )
-                messages.append({"role": "user", "content": errmsg})
-                continue
-            # Clean finish — model gave a conversational response
-            break
-
-        json_error_count = 0  # reset on clean parse
-
-        # ── Execute tools — SEQUENTIAL ONLY for small models ─────────
-        # Parallel execution confuses 7B/9B models: observations arrive
-        # out-of-order relative to reasoning. Always execute one at a time.
-        current_plugins = get_dynamic_plugins()
-
-        # Execute only the FIRST valid tool call per step.
-        # If the model emitted multiple, we'll process the rest next iteration.
-        tool_name, tool_args = tool_calls[0]
-        if len(tool_calls) > 1:
-            console.print(
-                f"[dim]ℹ  Model requested {len(tool_calls)} tools; executing first ({tool_name}), "
-                "rest will follow in subsequent steps.[/dim]"
-            )
-
-        # ── Comprehensive loop detection ──────────────────────────────────
-        sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-
-        # 1. Global per-signature count — excludes 'think' (it's always unique reasoning)
-        if tool_name != "think":
-            tool_sig_counts[sig] += 1
-        recent_tools.append(tool_name)
-
-        if tool_sig_counts[sig] > CONFIG["max_repeat_count"]:
-            console.print(f"[bold red]🔄 Loop: '{tool_name}' called {tool_sig_counts[sig]}× total![/bold red]")
+        if tool_calls and transition_match:
+            # Model tried to do both. We prioritize the tool call because it needs
+            # the result before it can actually transition. We silently ignore the transition.
+            transition_match = None
             
-            if tool_name in CONCRETE_TOOLS:
-                msg = (
-                    f"SYSTEM WARNING: You have called '{tool_name}' with the same broken arguments "
-                    f"{tool_sig_counts[sig]} times. Your code is failing. "
-                    "STOP trying the exact same code. You must completely change your approach, "
-                    "fix the syntax error, or ask the user for help."
-                )
+        current_plugins = get_dynamic_plugins()
+        
+        if transition_match:
+            new_state = transition_match.group(1).strip().upper()
+            if new_state in ["EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"]:
+                current_state = new_state
+                console.print(f"[bold magenta]🔄 Transitioning to {current_state}[/bold magenta]")
+                if current_state == "DONE":
+                    break
             else:
-                msg = (
-                    f"SYSTEM WARNING: You have called '{tool_name}' with the same arguments "
-                    f"{tool_sig_counts[sig]} times. You already have the result. Stop re-reading. "
-                    "Your next action MUST use execute_python or write_file to make a real change."
-                )
-
-            messages.append({"role": "user", "content": msg})
-            last_tool_sig = None
-            repeat_count = 0
+                messages.append({"role": "user", "content": f"SYSTEM WARNING: Invalid state '{new_state}'. Valid states are EVALUATE, RESEARCH, SYNTHESIS, ACTION, DONE."})
             continue
-        # 2. Alternating pattern detection: e.g. [A,B,A,B,A,B] in last 6 calls
-        if len(recent_tools) >= 6:
-            last6 = list(recent_tools)[-6:]
-            # Pattern [X,Y,X,Y,X,Y] — two tools alternating 3 times
-            if (last6[0] == last6[2] == last6[4] and
-                    last6[1] == last6[3] == last6[5] and
-                    last6[0] != last6[1]):
-                console.print(
-                    f"[bold red]🔄 Alternating loop detected: "
-                    f"{last6[0]}↔{last6[1]} repeating![/bold red]"
-                )
+        
+        if tool_calls:
+            observations = []
+            
+            for tool_name, tool_args in tool_calls:
+                # Loop Detection
+                sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+                if tool_name != "think":
+                    tool_sig_counts[sig] += 1
+                recent_tools.append(tool_name)
                 
-                if last6[0] in CONCRETE_TOOLS or last6[1] in CONCRETE_TOOLS:
-                    msg = (
-                        f"SYSTEM WARNING: You are stuck alternating between '{last6[0]}' and "
-                        f"'{last6[1]}'. Your actions are failing. STOP repeating the same steps. "
-                        "Change your approach completely or ask for help."
-                    )
-                else:
-                    msg = (
-                        f"SYSTEM WARNING: You are stuck alternating between '{last6[0]}' and "
-                        f"'{last6[1]}' without making progress. You already know the file contents. "
-                        "STOP reading. Your ONLY valid next action is to write improved code with "
-                        "execute_python or write_file. Take concrete action NOW."
-                    )
+                if tool_sig_counts[sig] > CONFIG["max_repeat_count"]:
+                    console.print(f"[bold red]🔄 Loop: '{tool_name}' called {tool_sig_counts[sig]}× total![/bold red]")
+                    observations.append(f"OBSERVATION from {tool_name}:\n[CRITICAL SYSTEM OVERRIDE] Tool {tool_name} with these arguments is BLOCKED because you are in an infinite loop. DO NOT apologize. DO NOT use this tool again. Transition to a different state or use a different tool IMMEDIATELY.")
+                    continue
                 
-                messages.append({"role": "user", "content": msg})
-                last_tool_sig = None
-                repeat_count = 0
-                continue
-
-        # 3. Consecutive repeat guard (original fast path)
-        if sig == last_tool_sig:
-            repeat_count += 1
-            if repeat_count >= CONFIG["max_repeat_count"]:
-                if tool_name in CONCRETE_TOOLS:
-                    msg = (
-                        f"SYSTEM: '{tool_name}' failed or returned the same result twice in a row. "
-                        "Your code is broken. Do NOT try the exact same code again. Fix it."
-                    )
-                else:
-                    msg = (
-                        f"SYSTEM: '{tool_name}' returned the same result twice in a row. "
-                        "Use the information you already have and move forward."
-                    )
+                if len(recent_tools) >= 6:
+                    last6 = list(recent_tools)[-6:]
+                    if last6[0] == last6[2] == last6[4] and last6[1] == last6[3] == last6[5] and last6[0] != last6[1]:
+                        console.print(f"[bold red]🔄 Alternating loop detected: {last6[0]}↔{last6[1]} repeating![/bold red]")
+                        observations.append(f"OBSERVATION from {tool_name}:\n[CRITICAL SYSTEM OVERRIDE] You are stuck alternating between '{last6[0]}' and '{last6[1]}'. DO NOT apologize. Change your approach completely.")
+                        continue
+                        
+                # Enforce state constraints
+                if current_state == "RESEARCH" and tool_name in ["write_file"]:
+                    observations.append(f"OBSERVATION from {tool_name}:\nSYSTEM WARNING: Tool '{tool_name}' is forbidden in RESEARCH state.")
+                    continue
+                if current_state == "ACTION" and tool_name in ["search_web", "read_url"]:
+                    observations.append(f"OBSERVATION from {tool_name}:\nSYSTEM WARNING: Tool '{tool_name}' is forbidden in ACTION state.")
+                    continue
+                if current_state == "SYNTHESIS":
+                    observations.append(f"OBSERVATION from {tool_name}:\nSYSTEM WARNING: You cannot call ANY tools in the SYNTHESIS state.")
+                    continue
+                    
+                console.print(f"╭{'─'*31} Tool Call {'─'*31}╮")
+                console.print(f"│ 🔧 {tool_name:<73}│")
+                console.print(f"╰{'─'*75}╯")
                 
-                messages.append({"role": "user", "content": msg})
-                repeat_count = 0
-                last_tool_sig = None
-                continue
-        else:
-            repeat_count = 0
-            last_tool_sig = sig
-
-        # Hot-reload plugins (agent may have just written one)
-        current_plugins = get_dynamic_plugins()
-
-        console.print(Panel(
-            f"[bold cyan]🔧 {tool_name}[/bold cyan]\n"
-            f"[dim]{json.dumps(tool_args, indent=2)[:500]}[/dim]",
-            title=f"Tool Call  [dim](step {step})[/dim]", border_style="cyan",
-        ))
-
-        t_tool = time.time()
-        result = route_tool(tool_name, tool_args, current_plugins)
-        dur_tool = time.time() - t_tool
-        logger.tool_call(tool_name, tool_args, result, dur_tool)
-
-        # Display full result in terminal
-        preview = str(result)
-        if len(preview) > 1500:
-            preview = preview[:1500] + f"\n… [{len(str(result)):,} chars total]"
-        console.print(Panel(
-            f"[green]👁  Observation[/green] [dim]({dur_tool:.2f}s)[/dim]\n\n{preview}",
-            border_style="green",
-        ))
-
-        # Offload large observations to file — keep context clean for small model
-        context_result = _prepare_observation(tool_name, str(result))
-
-        # Update progress counter
-        if tool_name in CONCRETE_TOOLS:
-            steps_without_concrete = 0  # reset on real action
-        else:
-            steps_without_concrete += 1
-
-        # ── Progress enforcer: force concrete output after too much research ──
-        if steps_without_concrete >= MAX_RESEARCH_STEPS:
-            console.print(
-                f"[bold red]⏰ No concrete output in {steps_without_concrete} steps. "
-                f"Forcing action.[/bold red]"
-            )
-            steps_without_concrete = 0
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"URGENT — ACTION REQUIRED: You have completed {MAX_RESEARCH_STEPS} steps "
-                    "of research without producing any output file or running any code.\n"
-                    "You already have enough information. STOP researching.\n"
-                    "Write Python code RIGHT NOW using execute_python to create or modify the "
-                    "target file with whatever content you have gathered so far.\n"
-                    "Do NOT search the web again. Do NOT read any files. Just write the code."
-                ),
-            })
-            continue
-
-        # Refresh plugin list (catches newly created plugins)
-        current_plugins = get_dynamic_plugins()
-
-        # Feed observation back — clear, simple format for small models
-        messages.append({
-            "role": "user",
-            "content": f"OBSERVATION from {tool_name}:\n{context_result}\n\nWhat is your next step?"
-        })
-
-        # Keep system prompt in sync with any newly loaded plugins
-        active_tools = list(BASE_TOOLS) + [p.TOOL_SCHEMA for p in current_plugins.values()]
-        messages[0]["content"] = SYSTEM_PROMPT.replace(
-            "{TOOLS_JSON}", json.dumps(active_tools, indent=2)
-        )
-
+                t_tool = time.time()
+                result = route_tool(tool_name, tool_args, current_plugins)
+                dur_tool = time.time() - t_tool
+                
+                logger.tool_call(tool_name, tool_args, str(result), dur_tool)
+                
+                preview = str(result)
+                if len(preview) > 1500:
+                    preview = preview[:1500] + f"\n… [{len(str(result)):,} chars total]"
+                console.print(Panel(f"[green]👁 Observation[/green] [dim]({dur_tool:.2f}s)[/dim]\n\n{preview}", border_style="green"))
+                
+                # Offload observations natively to avoid blowing up context
+                context_result = _prepare_observation(tool_name, str(result))
+                observations.append(f"OBSERVATION from {tool_name}:\n{context_result}")
+                
+            if observations:
+                messages.append({"role": "user", "content": "\n\n---\n\n".join(observations)})
+            
+            # Keep system prompt in sync with any newly loaded plugins
+            active_tools = list(BASE_TOOLS) + [p.TOOL_SCHEMA for p in current_plugins.values()]
+            tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
+            messages[0]["content"] = SYSTEM_PROMPT_TEMPLATE.replace("{TOOLS_XML}", tools_xml_str).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
+            
     return messages
+
 
 # ═══════════════════════════════════════════════════════
 # ASYNC INPUT  (stdin + inbox.txt polling)
@@ -1146,7 +978,8 @@ def main() -> None:
         title="[bold]AutoAgent[/bold]",
     ))
 
-    system_content = SYSTEM_PROMPT.replace("{TOOLS_JSON}", json.dumps(active_tools, indent=2))
+    tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
+    system_content = SYSTEM_PROMPT_TEMPLATE.replace("{TOOLS_XML}", tools_xml_str).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
     messages: List[Dict] = [{"role": "system", "content": system_content}]
 
     # Session restore is DISABLED.
@@ -1187,13 +1020,14 @@ def main() -> None:
 
             # Refresh tool list (plugins may have changed between turns)
             active_tools = build_active_tools()
+            tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
             messages[0]["content"] = SYSTEM_PROMPT.replace(
-                "{TOOLS_JSON}", json.dumps(active_tools, indent=2)
+                "{TOOLS_XML}", tools_xml_str
             )
             messages.append({"role": "user", "content": user_input})
 
             try:
-                messages = react_loop(user_input, messages)
+                messages = state_machine_loop(user_input, messages)
             except KeyboardInterrupt:
                 console.print("\n[bold red]⛔ Interrupted! Returning to prompt…[/bold red]")
                 messages.append({
