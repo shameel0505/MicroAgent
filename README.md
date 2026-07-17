@@ -1,57 +1,62 @@
-# AutoAgent 🤖
+# MicroAgent Framework 🔬
 
-AutoAgent is a robust, autonomous AI agent framework designed to execute complex tasks using local, small-parameter Large Language Models (LLMs) like `qwen2.5-coder:7b`. It operates through a highly resilient state machine and features native tool-calling capabilities, a three-tier memory system, and strict sandboxed execution.
+**MicroAgent** is an enterprise-grade autonomous AI framework explicitly engineered to maximize the reliability and reasoning capabilities of small-parameter local LLMs (e.g., `7B` to `9B` parameter classes). By abandoning standard reactive loops in favor of a strictly deterministic state machine, MicroAgent achieves zero-shot execution stability typically reserved for massive API-gated models.
 
-## 🌟 Key Features
+## 🌟 Enterprise Architecture
 
-- **Strict State Machine Workflow**: Forces the LLM into a deliberate `EVALUATE → RESEARCH → SYNTHESIS → ACTION` pipeline, effectively mitigating the hallucination and looping issues common in 7B-class models.
-- **Failproof Loop Detection**: Advanced heuristics instantly detect when the model falls into an infinite loop or alternating failure pattern (e.g., getting stuck due to missing permissions), automatically injecting a "Critical System Override" to force a change in strategy.
-- **Parallel Tool Execution**: Processes multiple tool calls efficiently in a single turn without overwhelming the model's context.
-- **3-Tier Memory Architecture**:
-  - **Scratchpad**: Short-term reasoning and summarization.
-  - **Semantic Memory**: Key-value store for facts and context spanning across runs.
-  - **Episodic Memory**: Long-term chronological logs.
-- **Sandboxed Environment**: Python execution and bash commands run in isolated subprocesses with strict timeouts and boundaries to prevent system damage.
-- **Dynamic Plugin System**: Hot-reloadable plugins in the `plugins/` directory (e.g., PowerPoint creation, PDF reading) extend the agent's capabilities without modifying core logic.
+- **Deterministic State Machine**: Replaces standard ReAct loops with a strict `EVALUATE → RESEARCH → SYNTHESIS → ACTION` pipeline. This architecture prevents "hallucination loops" and forces smaller models into structured, deliberate execution.
+- **Failproof Heuristics**: Advanced anomaly detection instantly identifies infinite loops, alternating failure states, or API timeouts. The orchestrator automatically applies "Context Pruning" (amnesia) to clear the model's polluted context and injects a `Critical System Override` to force a strategy pivot.
+- **Sandboxed Execution**: Python code and bash commands are strictly isolated in a designated workspace subprocess, complete with hard timeouts to protect host integrity.
+- **Dynamic Plugin Pipeline**: A hot-reloadable plugin architecture allows real-time capability expansion (e.g., MS Office document generation, PDF OCR) without requiring core logic restarts.
 
-## 🛠️ Architecture
+## 🧠 Cognitive Memory Systems
 
-AutoAgent breaks away from the standard `ReAct` loop in favor of a deterministic XML-based state machine. Small models often lose track of their objective in standard ReAct implementations. By forcing a structured transition through well-defined states, AutoAgent drastically improves reliability and reasoning capacity.
+MicroAgent implements a sophisticated 3-tier memory architecture to simulate continuous learning:
+1. **Scratchpad (Volatile)**: In-context buffer for chain-of-thought reasoning and immediate summarization.
+2. **Semantic Memory (Persistent)**: A key-value knowledge graph persisting facts, configurations, and user preferences across system reboots.
+3. **Episodic Memory (Append-Only)**: A chronological ledger of all past actions and observations, allowing the agent to perform historical retrospectives.
 
-- **Chain-of-Thought Mandate**: Every turn requires the LLM to output its reasoning inside `<thought>` tags before acting, ensuring it plans its actions logically.
-- **Context Pruning**: Prevents "in-context poisoning" by stripping out redundant failure loops from the model's immediate context window.
+## 🔮 Future Scopes & Possibilities
+
+To push the boundaries of what local, edge-deployed AI can accomplish, the roadmap for MicroAgent includes:
+
+### 1. Model Sparsity & Extreme Edge Deployment
+By leveraging **Sparsity** (e.g., MoE architectures) and aggressive quantization techniques (e.g., GGUF 4-bit/2-bit), MicroAgent will be optimized to run entirely in constrained edge environments (IoT devices, mobile processors) with minimal energy consumption and memory overhead, while maintaining enterprise-level reasoning via the state machine.
+
+### 2. Open-Source Ecosystem Integration
+MicroAgent is designed to serve as the cognitive core of a broader toolchain. Future iterations will include native hooks for:
+- **Vector Databases**: Integration with *ChromaDB* or *Milvus* for massive RAG (Retrieval-Augmented Generation) scaling.
+- **LangChain & LlamaIndex**: Seamless interoperability with existing open-source data loaders and unstructured data pipelines.
+
+### 3. Multi-Agent Swarm Orchestration
+Scaling the state machine to support a "Swarm" topology where multiple specialized MicroAgents (e.g., a dedicated `ResearcherAgent`, a `CoderAgent`, and an `ExecutorAgent`) can negotiate and pass context asynchronously over a local message broker (like Redis or MQTT).
+
+---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 - Python 3.9+
-- [Ollama](https://ollama.ai/) running locally with the `qwen2.5-coder:7b` model pulled.
+- [Ollama](https://ollama.ai/) running locally with the `qwen2.5-coder:7b` (or equivalent) model loaded.
 
-### Installation
+### Quickstart
 
-1. Clone the repository:
+1. **Clone & Setup**:
    ```bash
-   git clone https://github.com/yourusername/AutoAgent.git
-   cd AutoAgent
-   ```
-
-2. Set up the virtual environment:
-   ```bash
+   git clone https://github.com/shameel0505/MicroAgent.git
+   cd MicroAgent
    python3 -m venv qwen_venv
    source qwen_venv/bin/activate
-   pip install requests beautifulsoup4 duckduckgo-search rich
+   pip install -r requirements.txt
    ```
 
-3. Run the Agent:
+2. **Launch the Core**:
    ```bash
    python auto_agent.py
    ```
 
-### Usage
-Once the interface loads, you can drop prompts directly into the terminal or place a task inside `inbox.txt` for headless execution. AutoAgent will output its thoughts and observations via a rich streaming terminal UI.
-
-## 🤝 Contributing
-Contributions, issues, and feature requests are welcome! Feel free to check the issues page.
+3. **Usage**:
+   Interact directly via the CLI, or drop batch tasks into `inbox.txt` for headless automation. Watch as the model exposes its internal `<thought>` process securely in real-time.
 
 ---
-*Built with ❤️ for autonomous local AI execution.*
+*Developed with a focus on efficiency, transparency, and uncompromising reliability.*
