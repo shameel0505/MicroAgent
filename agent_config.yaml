@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════╗
-# ║    AutoAgent v3.0 — Config (Qwen 2.5 Coder 9B)     ║
+# ║    AutoAgent v4.0 — Config (Qwen 2.5 on Apple M4)   ║
 # ╚══════════════════════════════════════════════════════╝
 
 # ── Model ──────────────────────────────────────────────
@@ -19,12 +19,13 @@ web_timeout: 15
 workspace_dir: workspace
 plugins_dir: plugins
 
-# ── UX ─────────────────────────────────────────────────
+# ── UX & Intent ─────────────────────────────────────────
 enable_streaming: true
+enable_intent_gating: true
 
 # ── Planning ───────────────────────────────────────────
 enable_planning: true
-planning_threshold: 80
+planning_threshold: 50
 
 # ── Context — tuned for 7B/9B small models ─────────────
 # Small models lose coherence quickly with long histories.

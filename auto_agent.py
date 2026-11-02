@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════════════╗
-║            AutoAgent v3.0 — Elite Autonomous AI Agent            ║
-║  ReAct · Live Streaming · 3-Tier Memory · Sandboxed Python       ║
-║  Parallel Tools · Smart Compression · Plugin Hot-Reload          ║
-║  YAML Config · Structured Logging · Session Persistence          ║
+║            AutoAgent v4.0 — Elite Autonomous AI Agent            ║
+║  ReAct · Live Streaming · Intent Routing · Human-in-the-Loop     ║
+║  macOS Native Actions · 3-Tier Memory · Sandboxed Python         ║
+║  Parallel Tools · Smart Compression · Loop Self-Healing          ║
 ╚═══════════════════════════════════════════════════════════════════╝
 """
 
@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.live import Live
+from rich.table import Table
 from rich.rule import Rule
 
 try:
@@ -57,32 +58,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "workspace_dir": "workspace",
     "plugins_dir": "plugins",
 
-    # ── UX ──────────────────────────────────────────────────
+    # ── UX & Intent ─────────────────────────────────────────
     "enable_streaming": True,
+    "enable_intent_gating": True,
 
     # ── Planning ────────────────────────────────────────────
     "enable_planning": True,
-    "planning_threshold": 80,  # chars; tasks longer than this trigger auto-plan
+    "planning_threshold": 50,  # chars; tasks longer than this trigger auto-plan
 
     # ── Context — tuned for 7B/9B small models ──────────────
-    # Small models lose coherence quickly. Compress earlier, keep fewer.
-    "compress_threshold": 12,  # messages before compression (was 16)
-    "keep_recent": 8,          # messages to keep after compression (was 10)
+    "compress_threshold": 16,
+    "keep_recent": 8,
     "enable_smart_compress": True,
 
     # ── Tool output limits ───────────────────────────────────
-    "search_max_results": 5,   # fewer results → less token noise
+    "search_max_results": 5,
     "file_read_limit": 6000,
-    "url_read_limit": 4000,    # aggressively short for small context
+    "url_read_limit": 4000,
 
     # ── Observation offloading ───────────────────────────────
-    # If a tool result is larger than this, save to file instead of
-    # dumping the full text into the LLM context.
-    "observation_limit": 3000,  # chars sent back to LLM
-    "offload_large_obs": True,  # save huge results to workspace/obs_N.txt
+    "observation_limit": 3000,
+    "offload_large_obs": True,
 
     # ── Safety / loop prevention ─────────────────────────────
-    "max_steps": 30,           # hard cap on ReAct iterations per task
+    "max_steps": 25,
     "max_json_retries": 3,
     "max_repeat_count": 2,
 
@@ -99,13 +98,15 @@ def load_config() -> Dict[str, Any]:
     for p in [Path("agent_config.yaml"), Path("agent_config.json")]:
         if p.exists():
             try:
-                with open(p) as f:
-                    user = yaml.safe_load(f) if (HAS_YAML and p.suffix == ".yaml") else json.load(f)
-                if isinstance(user, dict):
-                    cfg.update(user)
+                if p.suffix in (".yaml", ".yml") and HAS_YAML:
+                    loaded = yaml.safe_load(p.read_text(encoding="utf-8"))
+                else:
+                    loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[warning] Failed to load {p}: {e}")
     return cfg
 
 
@@ -119,69 +120,85 @@ console = Console()
 class AgentLogger:
     def __init__(self, log_file: str):
         self.path = Path(log_file)
-        self.sid = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def _w(self, data: dict):
+        entry = {"time": datetime.now().isoformat(), **data}
         try:
-            entry = {"ts": datetime.now().isoformat(), "sid": self.sid, **data}
             with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, default=str) + "\n")
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
     def user_input(self, text: str):
-        self._w({"type": "input", "text": text})
+        self._w({"event": "user_input", "text": text})
 
     def llm_call(self, dur: float, toks: int):
-        self._w({"type": "llm", "dur_ms": int(dur * 1000), "toks_est": toks})
+        self._w({"event": "llm_call", "duration_s": round(dur, 2), "tokens": toks})
 
     def tool_call(self, name: str, args: dict, result: str, dur: float):
-        self._w({"type": "tool", "name": name, "args": args,
-                 "preview": result[:200], "dur_ms": int(dur * 1000)})
+        self._w({"event": "tool_call", "tool": name, "args": args,
+                 "result_len": len(result), "duration_s": round(dur, 2)})
 
     def error(self, msg: str):
-        self._w({"type": "error", "msg": msg})
+        self._w({"event": "error", "message": msg})
 
 
 logger = AgentLogger(CONFIG["log_file"])
 
 # ═══════════════════════════════════════════════════════
-# SYSTEM PROMPT
+# SYSTEM PROMPTS
 # ═══════════════════════════════════════════════════════
 
-# Deliberately compact for small (7B/9B) models.
-# Long system prompts eat into the effective context window and cause
-# small models to lose focus. Keep it tight and example-driven.
-SYSTEM_PROMPT_TEMPLATE = """You are AutoAgent — an autonomous AI with full MacOS access.
-You operate in a strict State Machine.
+SYSTEM_PROMPT_TEMPLATE = """You are AutoAgent — an elite autonomous workstation AI assistant running locally on Apple Silicon.
 Your current working directory is: {WORKSPACE_DIR}
 
-[MANDATORY FORMAT]
-For EVERY turn, you MUST output your reasoning inside <thought>...</thought> tags first!
-After your thought, you must either output tool call(s) OR a transition tag.
+[OPERATING PROTOCOL]
+1. For every turn, always begin with your reasoning in <thought>...</thought> tags.
+2. After your thought, invoke tool call(s) OR a <transition>STATE</transition> tag. Choose ONE.
+3. If you need user clarification or preferences, call <ask_user>. Never write questions to disk or sleep.
+4. When you have completed the task or produced deliverables, call <finish> with a complete final summary.
 
 [STATES]
-EVALUATE: Analyze the request and plan. Transition to RESEARCH or ACTION.
-RESEARCH: Gather info using read tools (search_web, read_url, read_file).
-SYNTHESIS: Write a compressed summary in <scratchpad>...</scratchpad> tags, then immediately <transition>ACTION</transition>.
-ACTION: Execute tasks to fulfill the goal using write tools (write_file, execute_python, run_command). Transition to DONE when finished.
-
-[RULES]
-1. Use XML tool tags for ALL tool calls.
-2. If info is missing, RESEARCH. If ready to build/modify, ACTION.
-3. NEVER call a tool and transition in the same turn. Choose ONE.
-4. You may execute multiple independent tools in the same turn.
+• EVALUATE: Analyze the user's task and plan next moves. Transition to RESEARCH or ACTION.
+• RESEARCH: Gather facts using read tools (search_web, read_url, read_file).
+• SYNTHESIS: Consolidate research in <scratchpad>...</scratchpad>, then transition to ACTION.
+• ACTION: Build deliverables using action tools (execute_python, write_file, run_command, open_file). Transition to DONE or call <finish> when done.
+• DONE: Task is complete.
 
 AVAILABLE TOOLS:
 {TOOLS_XML}
 """
 
+CHAT_PROMPT = """You are AutoAgent, a friendly, ultra-capable local AI workstation assistant powered by Qwen 2.5 on Apple Silicon M4.
+You assist the user with:
+• Autonomous deep web research & analysis
+• Generating production Python code, scripts, and utilities
+• Building formatted Excel workbooks (.xlsx) and slide presentations (.pptx)
+• Automating Mac desktop tasks, files, and terminal workflows
+• Answering technical, coding, and general knowledge questions
+
+Guidelines:
+- Respond warmly, directly, and concisely.
+- Do NOT output XML tags, state transitions, or tool calls during conversational chat.
+- If the user asks what you can do, give a brief, punchy overview of your capabilities and invite them to give you a task.
+"""
 
 # ═══════════════════════════════════════════════════════
 # BASE TOOL SCHEMAS
 # ═══════════════════════════════════════════════════════
 
 BASE_TOOLS: List[Dict] = [
+    {
+        "name": "ask_user",
+        "schema": "<ask_user>\n<question>Clarification question for the user</question>\n</ask_user>",
+        "description": "Ask the human user a question on the terminal when you need clarification, choices, or missing details. Execution pauses until the user replies."
+    },
+    {
+        "name": "finish",
+        "schema": "<finish>\n<summary>Comprehensive deliverable summary or answer</summary>\n</finish>",
+        "description": "Conclude the task and deliver the final answer/deliverable directly to the user."
+    },
     {
         "name": "search_web",
         "schema": "<search_web>\n<query>search query</query>\n</search_web>",
@@ -204,13 +221,28 @@ BASE_TOOLS: List[Dict] = [
     },
     {
         "name": "read_file",
-        "schema": "<read_file>\n<path>absolute or relative file path</path>\n</read_file>",
-        "description": "Read a local file's contents (up to 8 000 chars). Good for code, text, JSON, CSV."
+        "schema": "<read_file>\n<path>file path</path>\n</read_file>",
+        "description": "Read a local file's contents (up to 6,000 chars). Good for code, text, JSON, CSV."
     },
     {
         "name": "write_file",
         "schema": "<write_file>\n<path>file path</path>\n<content>text content to write</content>\n</write_file>",
         "description": "Write text to a local file. Creates missing directories. Overwrites if exists."
+    },
+    {
+        "name": "open_file",
+        "schema": "<open_file>\n<path>file path (e.g. .xlsx, .pptx, .pdf, .png)</path>\n</open_file>",
+        "description": "Open a generated file in its native macOS application (Excel, Keynote, Preview, etc.)."
+    },
+    {
+        "name": "open_url",
+        "schema": "<open_url>\n<url>Full URL to open</url>\n</open_url>",
+        "description": "Open a website URL in the user's default macOS web browser."
+    },
+    {
+        "name": "notify_user",
+        "schema": "<notify_user>\n<title>Notification title</title>\n<message>Notification message</message>\n</notify_user>",
+        "description": "Display a native macOS system notification banner with sound upon completing long tasks."
     },
     {
         "name": "list_directory",
@@ -220,7 +252,7 @@ BASE_TOOLS: List[Dict] = [
     {
         "name": "sleep",
         "schema": "<sleep>\n<seconds>seconds to wait</seconds>\n</sleep>",
-        "description": "Sleep for N seconds (use in polling/monitoring loops)."
+        "description": "Sleep for N seconds (use only in polling or waiting for external processes)."
     },
     {
         "name": "read_memory",
@@ -229,13 +261,13 @@ BASE_TOOLS: List[Dict] = [
     },
     {
         "name": "write_memory",
-        "schema": "<write_memory>\n<key>Memory key/label</key>\n<value>Value to remember</value>\n</write_memory>",
-        "description": "Save a fact to persistent semantic memory. Survives across sessions."
+        "schema": "<write_memory>\n<key>fact key</key>\n<value>fact value</value>\n</write_memory>",
+        "description": "Save a key-value fact to persistent semantic memory across sessions."
     },
     {
         "name": "search_memory",
-        "schema": "<search_memory>\n<query>Text to search</query>\n</search_memory>",
-        "description": "Search semantic memory for entries matching a text query."
+        "schema": "<search_memory>\n<query>search query</query>\n</search_memory>",
+        "description": "Search semantic memory keys and values for a substring."
     },
     {
         "name": "read_episodic",
@@ -267,7 +299,6 @@ def _save_json(path: str, data: Any) -> None:
         console.print(f"[red]Memory save error: {e}[/red]")
 
 
-# Semantic memory (key-value, persistent)
 def read_memory_fn() -> str:
     data = _load_json(CONFIG["memory_file"], {})
     filtered = {k: v for k, v in data.items() if not k.startswith("_")}
@@ -294,34 +325,83 @@ def search_memory_fn(query: str) -> str:
     return "Matches:\n" + "\n".join(f"  {k}: {v}" for k, v in hits)
 
 
-# Episodic memory (session summaries)
 def read_episodic_fn() -> str:
     eps = _load_json(CONFIG["episodic_file"], [])
     if not eps:
         return "No episodic memories yet."
-    return "\n".join(f"[{e.get('ts', '?')}] {e.get('summary', '')}" for e in eps[-30:])
+    lines = ["Episodic Memory (Past Tasks):"]
+    for e in eps[-5:]:
+        lines.append(f"• [{e.get('timestamp', '')[:10]}] Task: {e.get('task', '')}")
+        lines.append(f"  Outcome: {e.get('outcome', '')[:200]}")
+    return "\n".join(lines)
 
 
 def save_episode(task: str, outcome: str) -> None:
     eps = _load_json(CONFIG["episodic_file"], [])
     eps.append({
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "summary": f"Task: {task[:80]} → {outcome[:220]}"
+        "timestamp": datetime.now().isoformat(),
+        "task": task[:200],
+        "outcome": outcome[:500],
     })
-    _save_json(CONFIG["episodic_file"], eps[-100:])
+    eps = eps[-50:]  # keep last 50
+    _save_json(CONFIG["episodic_file"], eps)
 
 # ═══════════════════════════════════════════════════════
 # TOOL IMPLEMENTATIONS
 # ═══════════════════════════════════════════════════════
 
-def think_fn(reasoning: str) -> str:
-    # For small models: thinking is cheap, but we must force forward action.
-    # Return empty string so this step adds nothing to the context window —
-    # the model's THOUGHT is already captured in its reply text.
-    return ""
+def ask_user_fn(question: str) -> str:
+    console.print()
+    console.print(Panel(
+        f"[bold yellow]{question}[/bold yellow]",
+        title="[bold cyan]❓ AutoAgent Question[/bold cyan]",
+        border_style="cyan"
+    ))
+    try:
+        reply = input("👤 Your Reply: ").strip()
+        return f"User replied: {reply}" if reply else "User provided no answer."
+    except (EOFError, KeyboardInterrupt):
+        return "User cancelled the prompt."
 
 
-_OBS_CONTENT_HASH: Dict[str, str] = {}  # content_hash → obs_filepath
+def finish_fn(summary: str) -> str:
+    return f"TASK_COMPLETED: {summary}"
+
+
+def open_file_fn(path: str) -> str:
+    try:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            ws_p = Path(CONFIG["workspace_dir"]) / path
+            if ws_p.exists():
+                p = ws_p
+        if not p.exists():
+            return f"❌ File not found: {path}"
+        subprocess.run(["open", str(p.resolve())], check=True)
+        return f"✓ Opened {p.name} in macOS default application."
+    except Exception as e:
+        return f"❌ Failed to open file: {e}"
+
+
+def open_url_fn(url: str) -> str:
+    try:
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = f"https://{url}"
+        subprocess.run(["open", url], check=True)
+        return f"✓ Opened URL in default browser: {url}"
+    except Exception as e:
+        return f"❌ Failed to open URL: {e}"
+
+
+def notify_user_fn(title: str, message: str) -> str:
+    try:
+        clean_title = title.replace('"', '\\"')
+        clean_msg = message.replace('"', '\\"')
+        cmd = f'display notification "{clean_msg}" with title "{clean_title}" sound name "Glass"'
+        subprocess.run(["osascript", "-e", cmd], check=True)
+        return "✓ macOS notification delivered."
+    except Exception as e:
+        return f"❌ Notification error: {e}"
 
 
 def execute_python_sandboxed(code: str) -> str:
@@ -361,10 +441,14 @@ def run_command_fn(command: str) -> str:
 def read_file_fn(path: str) -> str:
     try:
         p = Path(path).expanduser()
+        if not p.is_absolute() and not p.exists():
+            ws_p = Path(CONFIG["workspace_dir"]) / path
+            if ws_p.exists():
+                p = ws_p
         content = p.read_text(encoding="utf-8", errors="replace")
         limit = CONFIG["file_read_limit"]
         if len(content) > limit:
-            return content[:limit] + f"\n\n… [truncated — {len(content):,} total chars, showing first {limit:,}]"
+            content = content[:limit] + f"\n\n… [truncated at {limit:,} chars]"
         return content
     except Exception as e:
         return f"❌ File read error: {e}"
@@ -373,6 +457,8 @@ def read_file_fn(path: str) -> str:
 def write_file_fn(path: str, content: str) -> str:
     try:
         p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = Path(CONFIG["workspace_dir"]) / path
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"✓ Wrote {len(content.encode()):,} bytes → {p}"
@@ -383,23 +469,27 @@ def write_file_fn(path: str, content: str) -> str:
 def list_dir_fn(path: str) -> str:
     try:
         p = Path(path).expanduser()
+        if not p.is_absolute() and not p.exists():
+            ws_p = Path(CONFIG["workspace_dir"]) / path
+            if ws_p.exists():
+                p = ws_p
         if not p.exists():
             return f"❌ Path does not exist: {path}"
         rows = []
         for item in sorted(p.iterdir()):
             if item.is_dir():
-                rows.append(f"📁  {item.name}/")
+                rows.append(f"📁 {item.name}/")
             else:
-                sz = item.stat().st_size
-                label = f"{sz}B" if sz < 1024 else f"{sz // 1024}KB" if sz < 1024 ** 2 else f"{sz // 1024 ** 2}MB"
-                rows.append(f"📄  {item.name}  ({label})")
-        return "\n".join(rows) if rows else "Empty directory."
+                rows.append(f"📄 {item.name} ({item.stat().st_size:,} bytes)")
+        return "\n".join(rows) if rows else "(empty directory)"
     except Exception as e:
-        return f"❌ List error: {e}"
+        return f"❌ List dir error: {e}"
 
 
 def search_web_fn(query: str) -> str:
     try:
+        if not DDGS:
+            return "❌ DuckDuckGo search library not available."
         results = DDGS().text(query, max_results=CONFIG["search_max_results"])
         if not results:
             return "No results found."
@@ -435,12 +525,12 @@ def read_url_fn(url: str) -> str:
 
 
 def sleep_fn(seconds: int) -> str:
-    console.print(f"[blue]💤 Sleeping {seconds}s...[/blue]")
+    console.print(f"[blue]💤 Waiting {seconds}s...[/blue]")
     time.sleep(seconds)
-    return f"✓ Woke up. Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    return f"✓ Resumed. Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
 # ═══════════════════════════════════════════════════════
-# PLUGIN SYSTEM  (mtime-cached hot-reload)
+# PLUGIN SYSTEM
 # ═══════════════════════════════════════════════════════
 
 _plugin_cache: Dict[str, Any] = {}
@@ -476,7 +566,7 @@ def get_dynamic_plugins() -> Dict[str, Any]:
     return plugins
 
 # ═══════════════════════════════════════════════════════
-# LLM COMMUNICATION
+# LLM INFERENCE & STREAMING
 # ═══════════════════════════════════════════════════════
 
 def estimate_tokens(text: str) -> int:
@@ -487,14 +577,14 @@ def context_tokens(messages: List[Dict]) -> int:
     return sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
 
 
-def stream_ollama(messages: List[Dict]):
-    """Yield text chunks from the Ollama streaming API."""
+def stream_ollama(messages: List[Dict], temperature: Optional[float] = None):
     url = f"{CONFIG['ollama_url']}/api/chat"
+    temp = temperature if temperature is not None else CONFIG["temperature"]
     payload = {
         "model": CONFIG["model"],
         "messages": messages,
         "stream": True,
-        "options": {"temperature": CONFIG["temperature"], "num_ctx": CONFIG["context_size"]},
+        "options": {"temperature": temp, "num_ctx": CONFIG["context_size"]},
     }
     try:
         with requests.post(url, json=payload, stream=True, timeout=180) as resp:
@@ -515,14 +605,13 @@ def stream_ollama(messages: List[Dict]):
         yield f"\n[⚠ LLM Error: {e}]"
 
 
-def chat_ollama_blocking(messages: List[Dict]) -> Dict:
-    """Blocking (non-streaming) call — for planning and summarisation."""
+def chat_ollama_blocking(messages: List[Dict], temperature: float = 0.1) -> Dict:
     url = f"{CONFIG['ollama_url']}/api/chat"
     payload = {
         "model": CONFIG["model"],
         "messages": messages,
         "stream": False,
-        "options": {"temperature": 0.1, "num_ctx": CONFIG["context_size"]},
+        "options": {"temperature": temperature, "num_ctx": CONFIG["context_size"]},
     }
     for attempt in range(CONFIG["llm_retries"]):
         try:
@@ -536,15 +625,50 @@ def chat_ollama_blocking(messages: List[Dict]) -> Dict:
                 return {"role": "assistant", "content": f"[LLM Error: {e}]"}
 
 # ═══════════════════════════════════════════════════════
-# CONTEXT MANAGEMENT  (smart compression)
+# CONVERSATION FAST-PATH (GREETINGS & GENERAL CHAT)
+# ═══════════════════════════════════════════════════════
+
+def is_conversational(text: str) -> bool:
+    if not CONFIG.get("enable_intent_gating", True):
+        return False
+    t = text.strip().lower().rstrip("!?.")
+    if not t:
+        return True
+    GREETINGS = {
+        "hi", "hello", "hey", "howdy", "sup", "yo", "good morning", "good evening",
+        "good afternoon", "who are you", "what are you", "what can you do", "help",
+        "what are your tools", "what tools do you have", "thanks", "thank you",
+        "cool", "nice", "awesome", "great", "ok", "okay"
+    }
+    if t in GREETINGS:
+        return True
+    words = t.split()
+    if len(words) <= 3 and words[0] in {"hi", "hello", "hey", "yo"}:
+        return True
+    return False
+
+
+def handle_conversation(user_input: str, messages: List[Dict]) -> None:
+    chat_prompt = [
+        {"role": "system", "content": CHAT_PROMPT},
+        {"role": "user", "content": user_input}
+    ]
+    console.print()
+    full_reply = ""
+    with Live(console=console, refresh_per_second=12, transient=False) as live:
+        live.update(Panel("[dim]Thinking...[/dim]", title="[bold cyan]🤖 AutoAgent[/bold cyan]", border_style="cyan"))
+        for chunk in stream_ollama(chat_prompt, temperature=0.7):
+            full_reply += chunk
+            live.update(Panel(Markdown(full_reply), title="[bold cyan]🤖 AutoAgent[/bold cyan]", border_style="cyan"))
+
+    messages.append({"role": "user", "content": user_input})
+    messages.append({"role": "assistant", "content": full_reply})
+
+# ═══════════════════════════════════════════════════════
+# CONTEXT MANAGEMENT (SMART COMPRESSION)
 # ═══════════════════════════════════════════════════════
 
 def smart_compress(messages: List[Dict]) -> List[Dict]:
-    """
-    Context compression tuned for small (7B/9B) models.
-    Small models degrade significantly with long histories — compress
-    earlier and more aggressively than you would with large models.
-    """
     threshold = CONFIG["compress_threshold"]
     keep = CONFIG["keep_recent"]
     if len(messages) <= threshold:
@@ -555,12 +679,10 @@ def smart_compress(messages: List[Dict]) -> List[Dict]:
     recent = messages[-keep:]
 
     if CONFIG["enable_smart_compress"] and to_compress:
-        # Keep snippet short — the summary call itself burns context
         snippet = "\n".join(
             f"{m['role'].upper()}: {str(m.get('content', ''))[:300]}"
             for m in to_compress
         )
-        # Use a minimal summarisation prompt (smaller = faster + less wasted tokens)
         summary_req = [
             {"role": "system", "content": (
                 "Summarise this agent conversation in 4-5 bullet points. "
@@ -568,25 +690,16 @@ def smart_compress(messages: List[Dict]) -> List[Dict]:
             )},
             {"role": "user", "content": snippet},
         ]
-        with console.status("[dim]📦 Compressing context...[/dim]", spinner="dots"):
-            summary_resp = chat_ollama_blocking(summary_req)
-        summary = summary_resp.get("content", "[compression unavailable]")
-        # Use a USER role for the summary — Qwen attends better to user turns
-        compressed = [
-            sys_msg,
-            {"role": "user", "content": f"[HISTORY SUMMARY]\n{summary}"},
-            {"role": "assistant", "content": "Understood. Continuing from where we left off."},
-        ]
-        compressed.extend(recent)
-        console.print(f"[dim]📦 Context: {len(messages)} → {len(compressed)} messages[/dim]")
-        return compressed
-
-    # Fallback: simple drop
-    return [sys_msg, {"role": "user", "content": "[older messages truncated]"},
-            {"role": "assistant", "content": "OK, continuing."}] + recent
+        resp = chat_ollama_blocking(summary_req)
+        summary = resp.get("content", "").strip()
+        if summary:
+            compressed = [sys_msg, {"role": "system", "content": f"[COMPRESSED HISTORY]\n{summary}"}] + recent
+            console.print(f"[dim]⚡ Compressed context: {len(messages)} → {len(compressed)} messages[/dim]")
+            return compressed
+    return [sys_msg] + recent
 
 # ═══════════════════════════════════════════════════════
-# TOOL EXTRACTION  (multi-block, auto-repair)
+# XML TOOL CALL EXTRACTION & ROUTING
 # ═══════════════════════════════════════════════════════
 
 def _parse_inner_args(inner_xml: str) -> Dict[str, str]:
@@ -599,47 +712,49 @@ def _parse_inner_args(inner_xml: str) -> Dict[str, str]:
 
 
 def extract_tool_calls(text: str) -> List[Tuple[str, Dict]]:
-    """Extract all valid XML tool calls from LLM response. Returns list of (name, args)."""
     calls: List[Tuple[str, Dict]] = []
-    
-    # Match <tool_name>...</tool_name>
     matches = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', text, re.DOTALL)
     for name, inner_xml in matches:
         if name in ("transition", "scratchpad", "thought"):
-            continue # Handled by state machine
-            
+            continue
         args = _parse_inner_args(inner_xml)
         if not args:
-            # Fallback for single-arg tools where the inner content is the raw value
+            raw = inner_xml.strip()
             if name == "execute_python":
-                args["code"] = inner_xml.strip()
+                args["code"] = raw
             elif name == "run_command":
-                args["command"] = inner_xml.strip()
+                args["command"] = raw
             elif name == "search_web":
-                args["query"] = inner_xml.strip()
+                args["query"] = raw
             elif name == "read_url":
-                args["url"] = inner_xml.strip()
+                args["url"] = raw
             elif name == "read_file":
-                args["path"] = inner_xml.strip()
+                args["path"] = raw
             elif name == "list_directory":
-                args["path"] = inner_xml.strip()
+                args["path"] = raw
             elif name == "sleep":
-                args["seconds"] = inner_xml.strip()
+                args["seconds"] = raw
             elif name == "search_memory":
-                args["query"] = inner_xml.strip()
-                
+                args["query"] = raw
+            elif name == "ask_user":
+                args["question"] = raw
+            elif name == "open_file":
+                args["path"] = raw
+            elif name == "open_url":
+                args["url"] = raw
+            elif name == "finish":
+                args["summary"] = raw
         calls.append((name, args))
-        
     return calls
 
-# ═══════════════════════════════════════════════════════
-# TOOL ROUTER
-# ═══════════════════════════════════════════════════════
 
 def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
-    """Dispatch a single tool call and return the observation string."""
     ROUTES = {
-        "think":          lambda: think_fn(args.get("reasoning", "")),
+        "ask_user":       lambda: ask_user_fn(args.get("question", "")),
+        "finish":         lambda: finish_fn(args.get("summary", "")),
+        "open_file":      lambda: open_file_fn(args.get("path", "")),
+        "open_url":       lambda: open_url_fn(args.get("url", "")),
+        "notify_user":    lambda: notify_user_fn(args.get("title", "AutoAgent"), args.get("message", "Task completed.")),
         "search_web":     lambda: search_web_fn(args.get("query", "")),
         "read_url":       lambda: read_url_fn(args.get("url", "")),
         "execute_python": lambda: execute_python_sandboxed(args.get("code", "")),
@@ -647,7 +762,7 @@ def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
         "read_file":      lambda: read_file_fn(args.get("path", "")),
         "write_file":     lambda: write_file_fn(args.get("path", ""), args.get("content", "")),
         "list_directory": lambda: list_dir_fn(args.get("path", ".")),
-        "sleep":          lambda: sleep_fn(int(args.get("seconds", 10))),
+        "sleep":          lambda: sleep_fn(int(args.get("seconds", 5))),
         "read_memory":    lambda: read_memory_fn(),
         "write_memory":   lambda: write_memory_fn(args.get("key", ""), args.get("value", "")),
         "search_memory":  lambda: search_memory_fn(args.get("query", "")),
@@ -670,48 +785,38 @@ def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
 _COMPLEX_WORDS = {
     "create", "build", "research", "analyze", "analyse", "generate", "compare",
     "summarize", "summarise", "automate", "write", "develop", "design", "find",
-    "scrape", "download", "monitor", "schedule", "deploy", "fetch", "extract",
+    "scrape", "download", "schedule", "deploy", "extract", "deck", "presentation", "excel"
 }
 
 
 def should_plan(task: str) -> bool:
-    if not CONFIG["enable_planning"]:
+    if not CONFIG.get("enable_planning", True):
         return False
     words = set(task.lower().split())
-    return len(task) > CONFIG["planning_threshold"] or bool(words & _COMPLEX_WORDS)
+    return len(task) > CONFIG.get("planning_threshold", 50) or bool(words & _COMPLEX_WORDS)
 
 
 def make_plan(task: str) -> str:
     msgs = [
         {"role": "system", "content": (
-            "You are a task planner for an AI agent. Given a task, produce a numbered "
-            "step-by-step execution plan with concrete actions (max 8 steps). "
-            "Output ONLY the plan — no intro, no conclusion."
+            "You are a master task planner for an AI agent on macOS. Given a task, produce a clean, "
+            "numbered 3 to 5 step execution roadmap. Be direct and concrete. "
+            "Output ONLY the numbered steps — no intro or conversational filler."
         )},
         {"role": "user", "content": f"Task: {task}"},
     ]
-    resp = chat_ollama_blocking(msgs)
-    return resp.get("content", "")
+    resp = chat_ollama_blocking(msgs, temperature=0.1)
+    return resp.get("content", "").strip()
 
 # ═══════════════════════════════════════════════════════
-# REACT LOOP  (core agent execution)
+# OBSERVATION OFFLOADING
 # ═══════════════════════════════════════════════════════
 
-# ── Observation counter for offloading ──────────────────────────────
 _obs_counter = 0
+_OBS_CONTENT_HASH: Dict[str, str] = {}
 
 
 def _prepare_observation(tool_name: str, result: str) -> str:
-    """
-    For small models: if the raw result is too long, save it to a file
-    and return a short pointer instead.  This keeps the context window
-    clean and prevents the model from losing track of its task.
-
-    Content-addressed: if the same content is returned by two different
-    calls (e.g. read_file on the same offloaded obs file), the SAME path
-    is reused — preventing the model from bypassing loop detection by
-    getting a new obs_N filename each time.
-    """
     global _obs_counter
     limit = CONFIG["observation_limit"]
     if not CONFIG["offload_large_obs"] or len(result) <= limit:
@@ -720,18 +825,15 @@ def _prepare_observation(tool_name: str, result: str) -> str:
     import hashlib
     content_hash = hashlib.md5(result.encode()).hexdigest()[:12]
 
-    # Reuse existing file if content is identical
     if content_hash in _OBS_CONTENT_HASH:
         existing = _OBS_CONTENT_HASH[content_hash]
         short = result[:limit]
         return (
             f"{short}\n\n"
             f"… [SAME CONTENT as before — already saved to {existing}\n"
-            f"You have already read this. Do NOT read it again.\n"
-            f"Use the information above to take action.]"
+            f"You have already seen this data. Proceed with your action.]"
         )
 
-    # New content: save to workspace
     _obs_counter += 1
     ws = Path(CONFIG["workspace_dir"])
     ws.mkdir(parents=True, exist_ok=True)
@@ -742,179 +844,198 @@ def _prepare_observation(tool_name: str, result: str) -> str:
         short = result[:limit]
         return (
             f"{short}\n\n"
-            f"… [OUTPUT TRUNCATED — full result ({len(result):,} chars) saved to:\n"
+            f"… [OUTPUT TRUNCATED — full result ({len(result):,} chars) offloaded to disk:\n"
             f"  {out_path}\n"
-            f"Use read_file to access specific sections if needed.]"
+            f"Use read_file if you need specific sections.]"
         )
     except Exception:
         return result[:limit] + f"\n… [truncated at {limit} chars]"
 
+# ═══════════════════════════════════════════════════════
+# AUTONOMOUS REACT STATE MACHINE LOOP
+# ═══════════════════════════════════════════════════════
 
 def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
-    """Execute one complete user turn through the State Machine."""
-    
     current_state = "EVALUATE"
     step = 0
     max_steps = CONFIG["max_steps"]
     
-    # ── Loop detection ─────────────────────────────────────────────────────
     tool_sig_counts: Counter = Counter()
     recent_tools: deque = deque(maxlen=8)
-    
+
     while True:
         step += 1
         if step > max_steps:
-            console.print(f"[bold red]⛔ Max steps ({max_steps}) reached. Stopping.[/bold red]")
+            console.print(f"\n[bold red]⛔ Reached safety step limit ({max_steps}).[/bold red]")
             messages.append({
                 "role": "system",
-                "content": f"[SYSTEM: Maximum step limit ({max_steps}) reached. Summarise what you accomplished and what remains.]",
+                "content": f"[SYSTEM: Maximum step limit reached. Provide a final summary of what was accomplished.]",
             })
-            with console.status("[yellow]Generating summary...[/yellow]", spinner="dots"):
+            with console.status("[yellow]Generating final summary...[/yellow]", spinner="dots"):
                 resp = chat_ollama_blocking(messages)
             summary = resp.get("content", "")
             if summary:
-                console.print(Panel(Markdown(summary), title="[yellow]Task Summary[/yellow]", border_style="yellow"))
+                console.print(Panel(Markdown(summary), title="[bold yellow]Task Summary[/bold yellow]", border_style="yellow"))
                 messages.append({"role": "assistant", "content": summary})
             break
-            
-        # Append state reminder explicitly
+
         state_prompt = f"[SYSTEM: You are currently in STATE: {current_state}. Please think, act, and transition.]"
         messages.append({"role": "user", "content": state_prompt})
-        
+        messages = smart_compress(messages)
         print_status(messages)
-        
+
         full_reply = ""
         t0 = time.time()
-        
+
         if CONFIG["enable_streaming"]:
             with Live(console=console, refresh_per_second=10, transient=False) as live:
-                live.update(Panel("[dim]…[/dim]",
-                                  title=f"[bold yellow]🤖 Agent [dim]({current_state})[/dim][/bold yellow]",
+                live.update(Panel("[dim]Thinking...[/dim]",
+                                  title=f"[bold yellow]🤖 AutoAgent [dim]({current_state})[/dim][/bold yellow]",
                                   border_style="yellow"))
                 for chunk in stream_ollama(messages):
                     full_reply += chunk
-                    # Convert <thought> to visible markdown blockquotes
                     visible_reply = full_reply.replace("<thought>", "> **💭 Thought:**\n> ").replace("</thought>", "\n")
                     display = Markdown(visible_reply) if len(visible_reply) < 4000 else visible_reply[-2000:]
                     live.update(Panel(display,
-                                      title=f"[bold yellow]🤖 Agent [dim]({current_state})[/dim][/bold yellow]",
+                                      title=f"[bold yellow]🤖 AutoAgent [dim]({current_state})[/dim][/bold yellow]",
                                       border_style="yellow"))
         else:
-            with console.status(f"[yellow]🤖 Thinking in {current_state}…[/yellow]", spinner="dots"):
+            with console.status(f"[yellow]🤖 Reasoning in {current_state}…[/yellow]", spinner="dots"):
                 resp = chat_ollama_blocking(messages)
                 full_reply = resp.get("content", "")
             visible_reply = full_reply.replace("<thought>", "> **💭 Thought:**\n> ").replace("</thought>", "\n")
             console.print(Panel(Markdown(visible_reply),
-                                title=f"[bold yellow]🤖 Agent ({current_state})[/bold yellow]",
+                                title=f"[bold yellow]🤖 AutoAgent ({current_state})[/bold yellow]",
                                 border_style="yellow"))
-                                
+
         dur_llm = time.time() - t0
         logger.llm_call(dur_llm, estimate_tokens(full_reply))
         messages.append({"role": "assistant", "content": full_reply})
-        
-        # Check for state transitions
+
         transition_match = re.search(r'<transition>(.*?)</transition>', full_reply, re.IGNORECASE)
-        
-        # Extract and execute tools
         tool_calls = extract_tool_calls(full_reply)
-        
+
+        # Check for explicit finish tool call
+        finish_call = next(((t, a) for t, a in tool_calls if t == "finish"), None)
+        if finish_call:
+            summary = finish_call[1].get("summary", "")
+            console.print(Panel(
+                Markdown(summary),
+                title="[bold green]✔ Task Deliverable Completed[/bold green]",
+                border_style="green"
+            ))
+            notify_user_fn("AutoAgent Task Complete", "Your requested deliverable is ready!")
+            break
+
+        # Natural conclusion or answer without XML tags
         if not tool_calls and not transition_match:
-            # Model hallucinated or gave pure text without transition
-            messages.append({"role": "user", "content": "SYSTEM WARNING: No XML tool calls or <transition> tags found. You MUST use XML tags to act or transition."})
-            continue
+            clean_reply = re.sub(r'<thought>.*?</thought>', '', full_reply, flags=re.DOTALL).strip()
+            if clean_reply and current_state in ("ACTION", "SYNTHESIS", "EVALUATE") and step > 1:
+                console.print(Panel(
+                    Markdown(clean_reply),
+                    title="[bold green]✔ Task Response[/bold green]",
+                    border_style="green"
+                ))
+                break
+            else:
+                messages.append({"role": "user", "content": "SYSTEM GUIDANCE: Use <tool_name>...</tool_name> to act, or <transition>STATE</transition> to move between states, or <finish> to conclude."})
+                continue
 
         if tool_calls and transition_match:
-            # Model tried to do both. We prioritize the tool call because it needs
-            # the result before it can actually transition. We silently ignore the transition.
-            transition_match = None
-            
+            transition_match = None  # prioritize tool execution
+
         current_plugins = get_dynamic_plugins()
-        
+
         if transition_match:
             new_state = transition_match.group(1).strip().upper()
             if new_state in ["EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"]:
                 current_state = new_state
                 console.print(f"[bold magenta]🔄 Transitioning to {current_state}[/bold magenta]")
                 if current_state == "DONE":
+                    clean_reply = re.sub(r'<thought>.*?</thought>', '', full_reply, flags=re.DOTALL).strip()
+                    if clean_reply:
+                        console.print(Panel(Markdown(clean_reply), title="[bold green]✔ Deliverable Complete[/bold green]", border_style="green"))
                     break
             else:
-                messages.append({"role": "user", "content": f"SYSTEM WARNING: Invalid state '{new_state}'. Valid states are EVALUATE, RESEARCH, SYNTHESIS, ACTION, DONE."})
+                messages.append({"role": "user", "content": f"SYSTEM WARNING: Invalid state '{new_state}'. Valid states: EVALUATE, RESEARCH, SYNTHESIS, ACTION, DONE."})
             continue
-        
+
         if tool_calls:
             observations = []
-            
+            break_loop = False
+
             for tool_name, tool_args in tool_calls:
-                # Loop Detection
                 sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-                if tool_name != "think":
-                    tool_sig_counts[sig] += 1
+                tool_sig_counts[sig] += 1
                 recent_tools.append(tool_name)
-                
+
+                # Hard Loop Prevention with Human Intervention
                 if tool_sig_counts[sig] > CONFIG["max_repeat_count"]:
-                    console.print(f"[bold red]🔄 Loop: '{tool_name}' called {tool_sig_counts[sig]}× total![/bold red]")
-                    observations.append(f"OBSERVATION from {tool_name}:\n[CRITICAL SYSTEM OVERRIDE] Tool {tool_name} with these arguments is BLOCKED because you are in an infinite loop. DO NOT apologize. DO NOT use this tool again. Transition to a different state or use a different tool IMMEDIATELY.")
-                    continue
-                
-                if len(recent_tools) >= 6:
-                    last6 = list(recent_tools)[-6:]
-                    if last6[0] == last6[2] == last6[4] and last6[1] == last6[3] == last6[5] and last6[0] != last6[1]:
-                        console.print(f"[bold red]🔄 Alternating loop detected: {last6[0]}↔{last6[1]} repeating![/bold red]")
-                        observations.append(f"OBSERVATION from {tool_name}:\n[CRITICAL SYSTEM OVERRIDE] You are stuck alternating between '{last6[0]}' and '{last6[1]}'. DO NOT apologize. Change your approach completely.")
+                    console.print(f"\n[bold red]⚠ Loop Intercepted: '{tool_name}' repeated {tool_sig_counts[sig]}× without progress.[/bold red]")
+                    console.print(Panel(
+                        f"The model is attempting to repeat [bold yellow]{tool_name}[/bold yellow] with identical arguments.\n"
+                        f"Arguments: [dim]{json.dumps(tool_args)}[/dim]\n\n"
+                        f"[cyan]Press Enter to stop and review, or type guidance to redirect the agent.[/cyan]",
+                        title="[bold red]Self-Healing Intercept[/bold red]",
+                        border_style="red"
+                    ))
+                    try:
+                        guidance = input("👤 Human Guidance: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        guidance = ""
+                    if not guidance:
+                        console.print("[yellow]Task paused by user.[/yellow]")
+                        break_loop = True
+                        break
+                    else:
+                        tool_sig_counts.clear()
+                        observations.append(f"OBSERVATION: Human supervisor intervened: {guidance}")
                         continue
-                        
-                # Enforce state constraints
-                if current_state == "RESEARCH" and tool_name in ["write_file"]:
-                    observations.append(f"OBSERVATION from {tool_name}:\nSYSTEM WARNING: Tool '{tool_name}' is forbidden in RESEARCH state.")
-                    continue
-                if current_state == "ACTION" and tool_name in ["search_web", "read_url"]:
-                    observations.append(f"OBSERVATION from {tool_name}:\nSYSTEM WARNING: Tool '{tool_name}' is forbidden in ACTION state.")
-                    continue
-                if current_state == "SYNTHESIS":
-                    observations.append(f"OBSERVATION from {tool_name}:\nSYSTEM WARNING: You cannot call ANY tools in the SYNTHESIS state.")
-                    continue
-                    
+
                 console.print(f"╭{'─'*31} Tool Call {'─'*31}╮")
                 console.print(f"│ 🔧 {tool_name:<73}│")
                 console.print(f"╰{'─'*75}╯")
-                
+
                 t_tool = time.time()
                 result = route_tool(tool_name, tool_args, current_plugins)
                 dur_tool = time.time() - t_tool
-                
+
                 logger.tool_call(tool_name, tool_args, str(result), dur_tool)
-                
+
                 preview = str(result)
-                if len(preview) > 1500:
-                    preview = preview[:1500] + f"\n… [{len(str(result)):,} chars total]"
+                if len(preview) > 1200:
+                    preview = preview[:1200] + f"\n… [{len(str(result)):,} chars total]"
                 console.print(Panel(f"[green]👁 Observation[/green] [dim]({dur_tool:.2f}s)[/dim]\n\n{preview}", border_style="green"))
-                
-                # Offload observations natively to avoid blowing up context
+
+                if str(result).startswith("TASK_COMPLETED:"):
+                    break_loop = True
+                    break
+
                 context_result = _prepare_observation(tool_name, str(result))
                 observations.append(f"OBSERVATION from {tool_name}:\n{context_result}")
-                
+
+            if break_loop:
+                break
+
             if observations:
                 messages.append({"role": "user", "content": "\n\n---\n\n".join(observations)})
-            
-            # Keep system prompt in sync with any newly loaded plugins
+
+            # Update system prompt with active tools
             active_tools = list(BASE_TOOLS) + [p.TOOL_SCHEMA for p in current_plugins.values()]
             tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
             messages[0]["content"] = SYSTEM_PROMPT_TEMPLATE.replace("{TOOLS_XML}", tools_xml_str).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
-            
+
     return messages
 
-
 # ═══════════════════════════════════════════════════════
-# ASYNC INPUT  (stdin + inbox.txt polling)
+# INPUT & CLI STATUS
 # ═══════════════════════════════════════════════════════
 
 def poll_input() -> str:
-    """Non-blocking poll: whichever arrives first — stdin or inbox.txt."""
     sys.stdout.write("\n👤 You: ")
     sys.stdout.flush()
 
     while True:
-        # Check inbox
         inbox = Path("inbox.txt")
         if inbox.exists():
             try:
@@ -927,16 +1048,14 @@ def poll_input() -> str:
             except Exception:
                 pass
 
-        # Non-blocking stdin (1-second window)
         try:
-            readable, _, _ = select.select([sys.stdin], [], [], 1.0)
+            readable, _, _ = select.select([sys.stdin], [], [], 0.5)
             if readable:
                 line = sys.stdin.readline().strip()
                 if line:
                     logger.user_input(line)
                     return line
         except Exception:
-            # Fallback for non-tty / Windows
             try:
                 line = input()
                 if line.strip():
@@ -944,43 +1063,42 @@ def poll_input() -> str:
             except (EOFError, KeyboardInterrupt):
                 return "exit"
 
-# ═══════════════════════════════════════════════════════
-# CONTEXT STATUS BAR
-# ═══════════════════════════════════════════════════════
 
 def print_status(messages: List[Dict]) -> None:
     toks = context_tokens(messages)
     max_t = CONFIG["context_size"]
     pct = min(toks / max_t * 100, 100)
-    bar_w = 22
+    bar_w = 20
     filled = int(bar_w * pct / 100)
     bar = "█" * filled + "░" * (bar_w - filled)
-    color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
+    color = "green" if pct < 50 else "yellow" if pct < 80 else "red"
     plugins = get_dynamic_plugins()
     console.print(
         f"[dim]Context [{color}]{bar}[/{color}] ~{toks:,} tokens (~{pct:.0f}%) | "
         f"Msgs: {len(messages)} | Plugins: {len(plugins)} | Model: {CONFIG['model']}[/dim]"
     )
 
-# ═══════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════
 
 def build_active_tools() -> List[Dict]:
     return list(BASE_TOOLS) + [p.TOOL_SCHEMA for p in get_dynamic_plugins().values()]
 
+# ═══════════════════════════════════════════════════════
+# MAIN INTERACTION LOOP
+# ═══════════════════════════════════════════════════════
 
 def main() -> None:
     active_tools = build_active_tools()
     plugin_count = len(active_tools) - len(BASE_TOOLS)
 
+    console.print()
     console.print(Panel.fit(
-        "[bold magenta]🤖  AutoAgent v3.0[/bold magenta]\n"
-        "[cyan]ReAct · Live Streaming · 3-Tier Memory · Sandboxed Python[/cyan]\n"
-        "[cyan]Parallel Tools · Smart Compression · Plugin Hot-Reload[/cyan]\n"
-        f"[dim]Model: {CONFIG['model']} | Context: {CONFIG['context_size']:,} tokens | "
-        f"Base tools: {len(BASE_TOOLS)} | Plugins: {plugin_count}[/dim]",
-        border_style="magenta",
+        "[bold cyan]⚡ AutoAgent v4.0 — Apple Silicon M4 Workstation Runtime[/bold cyan]\n"
+        "[dim]Closed-Loop ReAct · Human-in-the-Loop · Intent Fast-Path · macOS Native[/dim]\n\n"
+        f"• [bold white]Model:[/bold white] [green]{CONFIG['model']}[/green]   "
+        f"• [bold white]Context:[/bold white] [green]{CONFIG['context_size']:,} tokens[/green]   "
+        f"• [bold white]Tools:[/bold white] [green]{len(BASE_TOOLS)} base + {plugin_count} plugins[/green]\n"
+        f"• [bold white]Commands:[/bold white] [yellow]/help[/yellow], [yellow]/plan[/yellow], [yellow]/tools[/yellow], [yellow]/memory[/yellow], [yellow]/clear[/yellow], [yellow]/exit[/yellow]",
+        border_style="cyan",
         title="[bold]AutoAgent[/bold]",
     ))
 
@@ -988,84 +1106,97 @@ def main() -> None:
     system_content = SYSTEM_PROMPT_TEMPLATE.replace("{TOOLS_XML}", tools_xml_str).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
     messages: List[Dict] = [{"role": "system", "content": system_content}]
 
-    # Session restore is DISABLED.
-    # Restoring a failed/stuck session injects a confused context that
-    # causes the model to repeat the same failed actions on every restart.
-    # Each conversation starts fresh. The semantic memory (agent_memory.json)
-    # and episodic memory (agent_episodic.json) still persist facts across runs.
-    #
-    # To re-enable: uncomment the block below.
-    #
-    # if session_path.exists():
-    #     try:
-    #         saved = json.loads(session_path.read_text())
-    #         saved_msgs = saved.get("messages", [])
-    #         if len(saved_msgs) > 1:
-    #             messages = [messages[0]] + saved_msgs[1:]
-    #             console.print(f"[dim]📂 Session restored ...[/dim]")
-    #     except Exception:
-    #         pass
-
-    console.print(
-        "[dim]Type [bold]exit[/bold] to quit. "
-        "Drop tasks into [bold]inbox.txt[/bold] for headless mode.[/dim]"
-    )
-    console.rule(style="dim")
-
     try:
         while True:
             print_status(messages)
             user_input = poll_input()
 
-            if user_input.lower() in {"exit", "quit", "q"}:
-                console.print("\n[bold]👋 Goodbye![/bold]")
+            if user_input.lower() in {"exit", "quit", "/exit", "/quit", "q"}:
+                console.print("\n[bold]👋 Standing down AutoAgent. Have a great day![/bold]")
                 break
 
             if not user_input.strip():
                 continue
 
-            # Refresh tool list (plugins may have changed between turns)
+            # ── Slash Commands ──────────────────────────────────────────────
+            cmd = user_input.strip()
+            if cmd == "/clear" or cmd == "clear":
+                os.system("clear")
+                continue
+
+            if cmd == "/tools":
+                tbl = Table(title="Available AutoAgent Tools", border_style="cyan")
+                tbl.add_column("Tool Name", style="bold yellow")
+                tbl.add_column("Description", style="white")
+                for t in build_active_tools():
+                    if isinstance(t, dict):
+                        tbl.add_row(t.get("name", "plugin"), t.get("description", ""))
+                console.print(tbl)
+                continue
+
+            if cmd == "/memory":
+                mem = read_memory_fn()
+                console.print(Panel(mem, title="[cyan]Semantic Memory[/cyan]", border_style="cyan"))
+                continue
+
+            if cmd == "/help":
+                console.print(Panel(
+                    "• [bold yellow]Chat Naturally:[/bold yellow] Say 'hi', ask questions, discuss ideas.\n"
+                    "• [bold yellow]Give Tasks:[/bold yellow] 'Research Apple M4 benchmarks and save to excel'\n"
+                    "• [bold yellow]Human-in-the-Loop:[/bold yellow] If the agent needs details, it will ask you directly.\n"
+                    "• [bold yellow]macOS Actions:[/bold yellow] Generates files and opens them directly in Excel/Preview.\n"
+                    "• [bold yellow]Slash Commands:[/bold yellow] /tools, /plan, /memory, /clear, /exit",
+                    title="[bold cyan]AutoAgent Quick Guide[/bold cyan]",
+                    border_style="cyan"
+                ))
+                continue
+
+            # ── Intent Fast-Path for Conversation ───────────────────────────
+            if is_conversational(user_input):
+                handle_conversation(user_input, messages)
+                continue
+
+            # ── Dynamic Execution Plan for Complex Tasks ────────────────────
             active_tools = build_active_tools()
             tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
             messages[0]["content"] = SYSTEM_PROMPT_TEMPLATE.replace(
                 "{TOOLS_XML}", tools_xml_str
             ).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
+
+            if should_plan(user_input):
+                with console.status("[cyan]Formulating execution roadmap...[/cyan]", spinner="dots"):
+                    plan = make_plan(user_input)
+                if plan:
+                    console.print(Panel(
+                        plan,
+                        title="[bold cyan]📋 Execution Roadmap[/bold cyan]",
+                        border_style="cyan"
+                    ))
+                    messages.append({"role": "system", "content": f"[EXECUTION ROADMAP]:\n{plan}\nExecute these steps methodically."})
+
             messages.append({"role": "user", "content": user_input})
 
+            # ── Launch ReAct State Machine ──────────────────────────────────
             try:
                 messages = state_machine_loop(user_input, messages)
             except KeyboardInterrupt:
                 console.print("\n[bold red]⛔ Interrupted! Returning to prompt…[/bold red]")
                 messages.append({
                     "role": "system",
-                    "content": "[SYSTEM: User interrupted the agent. Task aborted.]",
+                    "content": "[SYSTEM: User interrupted the agent. Task halted.]",
                 })
             except Exception as e:
                 logger.error(str(e))
-                console.print(f"[red]Unexpected error: {e}[/red]")
+                console.print(f"[red]Execution error: {e}[/red]")
 
-            # Save episode summary from last assistant turn
+            # Save episode outcome
             for m in reversed(messages):
                 if m["role"] == "assistant" and len(m.get("content", "")) > 20:
                     save_episode(user_input, m["content"])
                     break
 
-            console.rule(style="dim")
-
-            # Persist session
-            try:
-                session_path.write_text(
-                    json.dumps(
-                        {"messages": messages, "ts": datetime.now().isoformat()},
-                        indent=2, default=str,
-                    ),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
-
     except KeyboardInterrupt:
-        console.print("\n[bold]Interrupted. Exiting.[/bold]")
+        console.print("\n[bold]👋 Goodbye![/bold]")
 
 
 if __name__ == "__main__":
