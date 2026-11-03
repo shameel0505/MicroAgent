@@ -1,11 +1,20 @@
-# 🔬 MicroAgent: Local ReAct Autonomous Agent Runtime
+# 🔬 MicroAgent: Local ReAct Autonomous Agent Runtime (v5.0)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Ollama](https://img.shields.io/badge/Runtime-Ollama%20(Local)-blueviolet.svg)](https://ollama.ai/)
 [![Local Inference](https://img.shields.io/badge/Model-Qwen%202.5%20Coder%207B-brightgreen.svg)](#)
 
-A modular, local-first autonomous agent engine designed specifically to maximize the task execution reliability of **small-parameter local models (7B - 9B)** like `qwen2.5-coder:7b`. Features sandboxed execution, observation offloading, a 3-tier memory model, and autonomous office deliverable synthesis (PowerPoint & Excel).
+A high-performance, local-first autonomous agent engine designed specifically to maximize task execution reliability on **small-parameter local models (7B - 9B)** like `qwen2.5-coder:7b` running on Apple Silicon.
+
+### 🌟 What's New in v5.0:
+- **Grammar Guardrails:** Ollama JSON schema logit-masking repairs tool dispatch when models omit XML tags.
+- **Parallel Tool Execution:** Read-only operations (`search_web`, `read_url`, `read_file`, etc.) execute concurrently via `ThreadPoolExecutor`.
+- **2-Tier Intent Classification:** Instant keyword fast-path + grammar LLM classifier for zero-latency chat vs. task routing.
+- **Session Persistence:** Save and restore full conversations and execution history across restarts (`/session`).
+- **macOS Workstation Native:** Native clipboard integration (`get_clipboard`, `set_clipboard`), AppleScript execution (`run_apple_script`), and Apple Notes creation (`create_note`).
+- **Memory Auto-Injection:** Semantic memory automatically injected into system prompts for persistent contextual awareness.
+- **Tool Deduplication & Safety:** Eliminates duplicate calls in a single turn and enforces loop-breaking heuristics.
 
 ---
 
@@ -18,27 +27,36 @@ A modular, local-first autonomous agent engine designed specifically to maximize
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
+│             Two-Tier Intent Gating (Chat vs Task)           │
+│  - Tier 1: Zero-latency Keyword Fast-Path                   │
+│  - Tier 2: Ollama Grammar-Enforced JSON Classifier          │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
 │                 ReAct Reasoning & State Loop                │
 │  - Observation Offloading (Large payloads written to disk)  │
-│  - Dynamic Context Pruning (Sliding window of K=8 turns)    │
+│  - Grammar Tool Repair (Fallback to logit-masked schema)    │
+│  - Dynamic Context Pruning (Smart summary + K=8 turns)      │
 │  - Loop Breaker Heuristics (Repetition counter / Backoff)   │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                       Tool Execution                        │
-│  - Isolated Python Sandbox (Subprocess with 30s timeout)    │
-│  - DuckDuckGo Web Search & Clean HTML Traversal             │
+│                 Parallel & Sequential Tools                 │
+│  - Parallel Read Pool (search_web, read_url, read_file)     │
+│  - Sequential Actions (execute_python, write_file, etc.)    │
 │  - Dynamic Plugin Architecture (Hot-reloadable)             │
-│  - Office Automation (openpyxl, python-pptx)                │
+│  - macOS Integration (Clipboard, AppleScript, Notes)        │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   3-Tier Memory Persistence                 │
+│                   3-Tier Memory & Session                   │
 │  1. Scratchpad (Volatile chain-of-thought)                  │
-│  2. Semantic Store (Key-value persistent entity graph)      │
+│  2. Semantic Store (Auto-injected into system prompt)       │
 │  3. Episodic Ledger (Chronological audit history)           │
+│  4. Session Persistence (agent_session.json save/restore)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 

@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """
-╔═══════════════════════════════════════════════════════════════════╗
-║            AutoAgent v4.0 — Elite Autonomous AI Agent            ║
-║  ReAct · Live Streaming · Intent Routing · Human-in-the-Loop     ║
-║  macOS Native Actions · 3-Tier Memory · Sandboxed Python         ║
-║  Parallel Tools · Smart Compression · Loop Self-Healing          ║
-╚═══════════════════════════════════════════════════════════════════╝
+AutoAgent v5.0
+==============
+What's new:
+  * Grammar-enforced tool dispatch  (Ollama format= logit mask)
+  * Parallel tool execution         (ThreadPoolExecutor for read tools)
+  * Session persistence             (save/restore conversations)
+  * Ollama health check at startup
+  * 5 new tools: append_file, get_clipboard, set_clipboard, run_apple_script, create_note
+  * Two-tier intent classifier      (fast keywords + grammar LLM)
+  * Tool deduplication within reply
+  * Memory auto-injection into system prompt
+  * /plan, /session, /history slash commands
+  * Step counter (step X of Y) in UI
+  * Thread-safe logger
 """
 
-import os, sys, json, re, time, subprocess, importlib.util, select
+import os, sys, json, re, time, subprocess, importlib.util, select, hashlib, threading
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 from bs4 import BeautifulSoup
+
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -23,12 +33,12 @@ except ImportError:
         from ddgs import DDGS
     except ImportError:
         DDGS = None
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.live import Live
 from rich.table import Table
-from rich.rule import Rule
 
 try:
     import yaml
@@ -41,55 +51,43 @@ except ImportError:
 # ═══════════════════════════════════════════════════════
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    # ── Model ───────────────────────────────────────────────
     "model": "qwen2.5-coder:7b",
     "context_size": 16384,
     "temperature": 0.0,
     "ollama_url": "http://localhost:11434",
     "llm_retries": 3,
     "retry_delay": 2,
-
-    # ── Timeouts ────────────────────────────────────────────
     "python_timeout": 30,
     "command_timeout": 30,
     "web_timeout": 15,
-
-    # ── Paths ───────────────────────────────────────────────
+    "intent_timeout": 8,
     "workspace_dir": "workspace",
     "plugins_dir": "plugins",
-
-    # ── UX & Intent ─────────────────────────────────────────
     "enable_streaming": True,
     "enable_intent_gating": True,
-
-    # ── Planning ────────────────────────────────────────────
+    "intent_use_grammar": True,
     "enable_planning": True,
-    "planning_threshold": 50,  # chars; tasks longer than this trigger auto-plan
-
-    # ── Context — tuned for 7B/9B small models ──────────────
-    "compress_threshold": 16,
+    "planning_threshold": 50,
+    "enable_grammar_repair": True,
+    "grammar_repair_timeout": 45,
+    "enable_parallel_tools": True,
+    "max_parallel_workers": 4,
+    "compress_threshold": 20,
     "keep_recent": 8,
     "enable_smart_compress": True,
-
-    # ── Tool output limits ───────────────────────────────────
     "search_max_results": 5,
     "file_read_limit": 6000,
     "url_read_limit": 4000,
-
-    # ── Observation offloading ───────────────────────────────
     "observation_limit": 3000,
     "offload_large_obs": True,
-
-    # ── Safety / loop prevention ─────────────────────────────
-    "max_steps": 25,
+    "max_steps": 30,
     "max_json_retries": 3,
     "max_repeat_count": 2,
-
-    # ── Persistence ─────────────────────────────────────────
     "memory_file": "agent_memory.json",
     "episodic_file": "agent_episodic.json",
     "session_file": "agent_session.json",
     "log_file": "agent.log",
+    "session_keep_messages": 40,
 }
 
 
@@ -114,34 +112,31 @@ CONFIG = load_config()
 console = Console()
 
 # ═══════════════════════════════════════════════════════
-# STRUCTURED LOGGER
+# STRUCTURED LOGGER (thread-safe)
 # ═══════════════════════════════════════════════════════
 
 class AgentLogger:
     def __init__(self, log_file: str):
         self.path = Path(log_file)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
 
     def _w(self, data: dict):
         entry = {"time": datetime.now().isoformat(), **data}
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with self._lock:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
-    def user_input(self, text: str):
-        self._w({"event": "user_input", "text": text})
-
-    def llm_call(self, dur: float, toks: int):
-        self._w({"event": "llm_call", "duration_s": round(dur, 2), "tokens": toks})
-
+    def user_input(self, text: str): self._w({"event": "user_input", "text": text})
+    def llm_call(self, dur: float, toks: int): self._w({"event": "llm_call", "duration_s": round(dur, 2), "tokens": toks})
     def tool_call(self, name: str, args: dict, result: str, dur: float):
-        self._w({"event": "tool_call", "tool": name, "args": args,
-                 "result_len": len(result), "duration_s": round(dur, 2)})
-
-    def error(self, msg: str):
-        self._w({"event": "error", "message": msg})
+        self._w({"event": "tool_call", "tool": name, "args": args, "result_len": len(result), "duration_s": round(dur, 2)})
+    def error(self, msg: str): self._w({"event": "error", "message": msg})
+    def grammar_repair(self, success: bool, reply_len: int):
+        self._w({"event": "grammar_repair", "success": success, "reply_len": reply_len})
 
 
 logger = AgentLogger(CONFIG["log_file"])
@@ -152,128 +147,92 @@ logger = AgentLogger(CONFIG["log_file"])
 
 SYSTEM_PROMPT_TEMPLATE = """You are AutoAgent — an elite autonomous workstation AI assistant running locally on Apple Silicon.
 Your current working directory is: {WORKSPACE_DIR}
+{MEMORY_CONTEXT}
 
 [OPERATING PROTOCOL]
-1. For every turn, always begin with your reasoning in <thought>...</thought> tags.
-2. After your thought, invoke tool call(s) OR a <transition>STATE</transition> tag. Choose ONE.
-3. If you need user clarification or preferences, call <ask_user>. Never write questions to disk or sleep.
-4. When you have completed the task or produced deliverables, call <finish> with a complete final summary.
+1. Always begin with your reasoning in <thought>...</thought> tags.
+2. After your thought, invoke ONE tool call OR a <transition>STATE</transition> tag. Never both.
+3. If you need user clarification, call <ask_user>. Never write questions to disk or sleep.
+4. When the task is fully complete, call <finish> with a comprehensive summary.
+5. Do NOT over-act. If the user asked a simple question, answer it and finish immediately.
 
 [STATES]
-• EVALUATE: Analyze the user's task and plan next moves. Transition to RESEARCH or ACTION.
-• RESEARCH: Gather facts using read tools (search_web, read_url, read_file).
-• SYNTHESIS: Consolidate research in <scratchpad>...</scratchpad>, then transition to ACTION.
-• ACTION: Build deliverables using action tools (execute_python, write_file, run_command, open_file). Transition to DONE or call <finish> when done.
-• DONE: Task is complete.
+EVALUATE  -> Analyse the task. Plan next move. Transition to RESEARCH or ACTION.
+RESEARCH  -> Gather facts: search_web, read_url, read_file.
+SYNTHESIS -> Consolidate research in <scratchpad>...</scratchpad>, then transition to ACTION.
+ACTION    -> Build deliverables: execute_python, write_file, run_command, open_file.
+DONE      -> Task complete. Call <finish>.
+
+[FINISH IMMEDIATELY when]
+- Task is answerable from your own knowledge
+- You have written the requested file(s)
+- Research is complete and synthesised
+- User asked a conversational or factual question
 
 AVAILABLE TOOLS:
 {TOOLS_XML}
 """
 
 CHAT_PROMPT = """You are AutoAgent, a friendly, ultra-capable local AI workstation assistant powered by Qwen 2.5 on Apple Silicon M4.
-You assist the user with:
-• Autonomous deep web research & analysis
-• Generating production Python code, scripts, and utilities
-• Building formatted Excel workbooks (.xlsx) and slide presentations (.pptx)
-• Automating Mac desktop tasks, files, and terminal workflows
-• Answering technical, coding, and general knowledge questions
-
 Guidelines:
 - Respond warmly, directly, and concisely.
 - Do NOT output XML tags, state transitions, or tool calls during conversational chat.
-- If the user asks what you can do, give a brief, punchy overview of your capabilities and invite them to give you a task.
 """
+
+# ═══════════════════════════════════════════════════════
+# GRAMMAR SCHEMAS (Ollama format= logit masks)
+# ═══════════════════════════════════════════════════════
+
+INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "enum": ["CHAT", "TASK"]},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+    },
+    "required": ["intent", "confidence"]
+}
+
+
+def _build_repair_schema(tool_names: List[str]) -> Dict:
+    return {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["call_tool", "transition", "finish", "respond"]},
+            "tool_name": {"type": "string", "enum": tool_names},
+            "tool_args": {"type": "object"},
+            "next_state": {"type": "string", "enum": ["EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"]},
+            "finish_summary": {"type": "string"}
+        },
+        "required": ["action"]
+    }
 
 # ═══════════════════════════════════════════════════════
 # BASE TOOL SCHEMAS
 # ═══════════════════════════════════════════════════════
 
 BASE_TOOLS: List[Dict] = [
-    {
-        "name": "ask_user",
-        "schema": "<ask_user>\n<question>Clarification question for the user</question>\n</ask_user>",
-        "description": "Ask the human user a question on the terminal when you need clarification, choices, or missing details. Execution pauses until the user replies."
-    },
-    {
-        "name": "finish",
-        "schema": "<finish>\n<summary>Comprehensive deliverable summary or answer</summary>\n</finish>",
-        "description": "Conclude the task and deliver the final answer/deliverable directly to the user."
-    },
-    {
-        "name": "search_web",
-        "schema": "<search_web>\n<query>search query</query>\n</search_web>",
-        "description": "Search the web via DuckDuckGo. Returns titles, URLs, and snippets."
-    },
-    {
-        "name": "read_url",
-        "schema": "<read_url>\n<url>Full URL to fetch</url>\n</read_url>",
-        "description": "Fetch and extract readable text from a URL. Strips nav/ads, focuses on main content."
-    },
-    {
-        "name": "execute_python",
-        "schema": "<execute_python>\n# python code here\n</execute_python>",
-        "description": "Run Python code in a sandboxed subprocess. Returns stdout + stderr. CWD is workspace/."
-    },
-    {
-        "name": "run_command",
-        "schema": "<run_command>\nbash command here\n</run_command>",
-        "description": "Run a bash command on MacOS. Returns combined stdout + stderr."
-    },
-    {
-        "name": "read_file",
-        "schema": "<read_file>\n<path>file path</path>\n</read_file>",
-        "description": "Read a local file's contents (up to 6,000 chars). Good for code, text, JSON, CSV."
-    },
-    {
-        "name": "write_file",
-        "schema": "<write_file>\n<path>file path</path>\n<content>text content to write</content>\n</write_file>",
-        "description": "Write text to a local file. Creates missing directories. Overwrites if exists."
-    },
-    {
-        "name": "open_file",
-        "schema": "<open_file>\n<path>file path (e.g. .xlsx, .pptx, .pdf, .png)</path>\n</open_file>",
-        "description": "Open a generated file in its native macOS application (Excel, Keynote, Preview, etc.)."
-    },
-    {
-        "name": "open_url",
-        "schema": "<open_url>\n<url>Full URL to open</url>\n</open_url>",
-        "description": "Open a website URL in the user's default macOS web browser."
-    },
-    {
-        "name": "notify_user",
-        "schema": "<notify_user>\n<title>Notification title</title>\n<message>Notification message</message>\n</notify_user>",
-        "description": "Display a native macOS system notification banner with sound upon completing long tasks."
-    },
-    {
-        "name": "list_directory",
-        "schema": "<list_directory>\n<path>directory path to list</path>\n</list_directory>",
-        "description": "List files and subdirectories at a path, with sizes."
-    },
-    {
-        "name": "sleep",
-        "schema": "<sleep>\n<seconds>seconds to wait</seconds>\n</sleep>",
-        "description": "Sleep for N seconds (use only in polling or waiting for external processes)."
-    },
-    {
-        "name": "read_memory",
-        "schema": "<read_memory></read_memory>",
-        "description": "Read all facts from persistent semantic memory (key-value store)."
-    },
-    {
-        "name": "write_memory",
-        "schema": "<write_memory>\n<key>fact key</key>\n<value>fact value</value>\n</write_memory>",
-        "description": "Save a key-value fact to persistent semantic memory across sessions."
-    },
-    {
-        "name": "search_memory",
-        "schema": "<search_memory>\n<query>search query</query>\n</search_memory>",
-        "description": "Search semantic memory keys and values for a substring."
-    },
-    {
-        "name": "read_episodic",
-        "schema": "<read_episodic></read_episodic>",
-        "description": "Read summaries of past completed tasks from episodic memory."
-    }
+    {"name": "ask_user",       "schema": "<ask_user>\n<question>Your question</question>\n</ask_user>",                                         "description": "Ask the user a clarifying question. Execution pauses until they reply."},
+    {"name": "finish",         "schema": "<finish>\n<summary>Final answer or deliverable summary</summary>\n</finish>",                         "description": "Conclude the task with a final answer. Call this when done."},
+    {"name": "search_web",     "schema": "<search_web>\n<query>search query</query>\n</search_web>",                                            "description": "DuckDuckGo web search. Returns titles, URLs, snippets."},
+    {"name": "read_url",       "schema": "<read_url>\n<url>URL to fetch</url>\n</read_url>",                                                    "description": "Fetch and extract readable text from a URL."},
+    {"name": "execute_python", "schema": "<execute_python>\n# python code\n</execute_python>",                                                  "description": "Run Python in a sandboxed subprocess. CWD is workspace/."},
+    {"name": "run_command",    "schema": "<run_command>\nbash command\n</run_command>",                                                          "description": "Run a bash command on macOS."},
+    {"name": "read_file",      "schema": "<read_file>\n<path>file path</path>\n</read_file>",                                                   "description": "Read a local file (up to 6,000 chars)."},
+    {"name": "write_file",     "schema": "<write_file>\n<path>path</path>\n<content>content</content>\n</write_file>",                         "description": "Write text to a file. Creates dirs. Overwrites if exists."},
+    {"name": "append_file",    "schema": "<append_file>\n<path>path</path>\n<content>content</content>\n</append_file>",                       "description": "Append text to a file without overwriting it."},
+    {"name": "open_file",      "schema": "<open_file>\n<path>file path</path>\n</open_file>",                                                   "description": "Open a file in its native macOS app (Excel, Preview, etc.)."},
+    {"name": "open_url",       "schema": "<open_url>\n<url>URL</url>\n</open_url>",                                                             "description": "Open a URL in the default macOS browser."},
+    {"name": "notify_user",    "schema": "<notify_user>\n<title>title</title>\n<message>message</message>\n</notify_user>",                    "description": "Show a native macOS notification banner."},
+    {"name": "list_directory", "schema": "<list_directory>\n<path>directory path</path>\n</list_directory>",                                    "description": "List files and subdirectories with sizes."},
+    {"name": "get_clipboard",  "schema": "<get_clipboard></get_clipboard>",                                                                       "description": "Read the current macOS clipboard."},
+    {"name": "set_clipboard",  "schema": "<set_clipboard>\n<text>text to copy</text>\n</set_clipboard>",                                       "description": "Write text to the macOS clipboard."},
+    {"name": "run_apple_script","schema": "<run_apple_script>\nAppleScript code here\n</run_apple_script>",                                    "description": "Execute arbitrary AppleScript on macOS."},
+    {"name": "create_note",    "schema": "<create_note>\n<title>Note title</title>\n<content>Body lines</content>\n</create_note>",            "description": "Create an Apple Note with title and bullets."},
+    {"name": "sleep",          "schema": "<sleep>\n<seconds>N</seconds>\n</sleep>",                                                             "description": "Wait N seconds (use only when polling external processes)."},
+    {"name": "read_memory",    "schema": "<read_memory></read_memory>",                                                                           "description": "Read all persistent semantic memory."},
+    {"name": "write_memory",   "schema": "<write_memory>\n<key>key</key>\n<value>value</value>\n</write_memory>",                             "description": "Save a key-value fact to persistent memory."},
+    {"name": "search_memory",  "schema": "<search_memory>\n<query>query</query>\n</search_memory>",                                            "description": "Search semantic memory for a substring."},
+    {"name": "read_episodic",  "schema": "<read_episodic></read_episodic>",                                                                       "description": "Read past task summaries from episodic memory."},
 ]
 
 # ═══════════════════════════════════════════════════════
@@ -292,9 +251,7 @@ def _load_json(path: str, default: Any) -> Any:
 
 def _save_json(path: str, data: Any) -> None:
     try:
-        Path(path).write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         console.print(f"[red]Memory save error: {e}[/red]")
 
@@ -310,7 +267,7 @@ def write_memory_fn(key: str, value: str) -> str:
     mem[key] = value
     mem["_updated"] = datetime.now().isoformat()
     _save_json(CONFIG["memory_file"], mem)
-    return f"✓ Saved to memory: {key!r} = {value!r}"
+    return f"Saved to memory: {key!r} = {value!r}"
 
 
 def search_memory_fn(query: str) -> str:
@@ -318,10 +275,9 @@ def search_memory_fn(query: str) -> str:
     if not mem:
         return "Semantic memory is empty."
     q = query.lower()
-    hits = [(k, v) for k, v in mem.items()
-            if not k.startswith("_") and (q in k.lower() or q in str(v).lower())]
+    hits = [(k, v) for k, v in mem.items() if not k.startswith("_") and (q in k.lower() or q in str(v).lower())]
     if not hits:
-        return f"No memory entries match '{query}'."
+        return f"No memory entries match {query!r}."
     return "Matches:\n" + "\n".join(f"  {k}: {v}" for k, v in hits)
 
 
@@ -331,34 +287,61 @@ def read_episodic_fn() -> str:
         return "No episodic memories yet."
     lines = ["Episodic Memory (Past Tasks):"]
     for e in eps[-5:]:
-        lines.append(f"• [{e.get('timestamp', '')[:10]}] Task: {e.get('task', '')}")
-        lines.append(f"  Outcome: {e.get('outcome', '')[:200]}")
+        lines.append(f"  [{e.get('timestamp', '')[:10]}] {e.get('task', '')} -> {e.get('outcome', '')[:150]}")
     return "\n".join(lines)
 
 
 def save_episode(task: str, outcome: str) -> None:
     eps = _load_json(CONFIG["episodic_file"], [])
-    eps.append({
-        "timestamp": datetime.now().isoformat(),
-        "task": task[:200],
-        "outcome": outcome[:500],
-    })
-    eps = eps[-50:]  # keep last 50
-    _save_json(CONFIG["episodic_file"], eps)
+    eps.append({"timestamp": datetime.now().isoformat(), "task": task[:200], "outcome": outcome[:500]})
+    _save_json(CONFIG["episodic_file"], eps[-50:])
+
+
+def get_memory_context() -> str:
+    mem = _load_json(CONFIG["memory_file"], {})
+    filtered = {k: v for k, v in mem.items() if not k.startswith("_")}
+    if not filtered:
+        return ""
+    lines = ["\n[USER MEMORY from past sessions]"]
+    for k, v in list(filtered.items())[:10]:
+        lines.append(f"  {k}: {v}")
+    return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════
+# SESSION PERSISTENCE
+# ═══════════════════════════════════════════════════════
+
+def load_session() -> Optional[List[Dict]]:
+    sf = Path(CONFIG["session_file"])
+    if not sf.exists():
+        return None
+    try:
+        data = json.loads(sf.read_text(encoding="utf-8"))
+        if isinstance(data, list) and len(data) > 1:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_session(messages: List[Dict]) -> None:
+    keep = CONFIG.get("session_keep_messages", 40)
+    try:
+        Path(CONFIG["session_file"]).write_text(
+            json.dumps(messages[-keep:], indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════
 # TOOL IMPLEMENTATIONS
 # ═══════════════════════════════════════════════════════
 
 def ask_user_fn(question: str) -> str:
-    console.print()
-    console.print(Panel(
-        f"[bold yellow]{question}[/bold yellow]",
-        title="[bold cyan]❓ AutoAgent Question[/bold cyan]",
-        border_style="cyan"
-    ))
+    console.print(Panel(f"[bold yellow]{question}[/bold yellow]",
+                        title="[bold cyan]AutoAgent Question[/bold cyan]", border_style="cyan"))
     try:
-        reply = input("👤 Your Reply: ").strip()
+        reply = input("Your Reply: ").strip()
         return f"User replied: {reply}" if reply else "User provided no answer."
     except (EOFError, KeyboardInterrupt):
         return "User cancelled the prompt."
@@ -376,21 +359,21 @@ def open_file_fn(path: str) -> str:
             if ws_p.exists():
                 p = ws_p
         if not p.exists():
-            return f"❌ File not found: {path}"
+            return f"File not found: {path}"
         subprocess.run(["open", str(p.resolve())], check=True)
-        return f"✓ Opened {p.name} in macOS default application."
+        return f"Opened {p.name} in macOS."
     except Exception as e:
-        return f"❌ Failed to open file: {e}"
+        return f"Failed to open file: {e}"
 
 
 def open_url_fn(url: str) -> str:
     try:
-        if not url.startswith("http://") and not url.startswith("https://"):
+        if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
         subprocess.run(["open", url], check=True)
-        return f"✓ Opened URL in default browser: {url}"
+        return f"Opened URL: {url}"
     except Exception as e:
-        return f"❌ Failed to open URL: {e}"
+        return f"Failed to open URL: {e}"
 
 
 def notify_user_fn(title: str, message: str) -> str:
@@ -399,108 +382,161 @@ def notify_user_fn(title: str, message: str) -> str:
         clean_msg = message.replace('"', '\\"')
         cmd = f'display notification "{clean_msg}" with title "{clean_title}" sound name "Glass"'
         subprocess.run(["osascript", "-e", cmd], check=True)
-        return "✓ macOS notification delivered."
+        return "macOS notification delivered."
     except Exception as e:
-        return f"❌ Notification error: {e}"
+        return f"Notification error: {e}"
 
 
 def execute_python_sandboxed(code: str) -> str:
-    """Run Python code in an isolated subprocess inside workspace/."""
     ws = Path(CONFIG["workspace_dir"])
     ws.mkdir(parents=True, exist_ok=True)
     try:
-        r = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True, text=True,
-            timeout=CONFIG["python_timeout"],
-            cwd=str(ws.resolve()),
-        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                           timeout=CONFIG["python_timeout"], cwd=str(ws.resolve()))
         out = r.stdout
         if r.stderr.strip():
             out += ("\n" if out else "") + f"[STDERR]\n{r.stderr.strip()}"
-        return out.strip() or "✓ Code executed with no output."
+        return out.strip() or "Code executed with no output."
     except subprocess.TimeoutExpired:
-        return f"❌ Timed out after {CONFIG['python_timeout']}s. Simplify or split the code."
+        return f"Timed out after {CONFIG['python_timeout']}s."
     except Exception as e:
-        return f"❌ Execution error: {e}"
+        return f"Execution error: {e}"
 
 
 def run_command_fn(command: str) -> str:
     try:
-        r = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=CONFIG["command_timeout"],
-        )
-        return (r.stdout + r.stderr).strip() or "✓ Command ran with no output."
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=CONFIG["command_timeout"])
+        return (r.stdout + r.stderr).strip() or "Command ran with no output."
     except subprocess.TimeoutExpired:
-        return f"❌ Command timed out after {CONFIG['command_timeout']}s"
+        return f"Command timed out after {CONFIG['command_timeout']}s"
     except Exception as e:
-        return f"❌ Command error: {e}"
+        return f"Command error: {e}"
+
+
+def _resolve_read_path(path: str) -> Path:
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    ws = Path(CONFIG["workspace_dir"])
+    if p.parts and p.parts[0] == ws.name:
+        return p
+    if p.exists():
+        return p
+    if (ws / p).exists():
+        return ws / p
+    return ws / p
+
+
+def _resolve_write_path(path: str) -> Path:
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    ws = Path(CONFIG["workspace_dir"])
+    if p.parts and p.parts[0] == ws.name:
+        return p
+    return ws / p
 
 
 def read_file_fn(path: str) -> str:
     try:
-        p = Path(path).expanduser()
-        if not p.is_absolute() and not p.exists():
-            ws_p = Path(CONFIG["workspace_dir"]) / path
-            if ws_p.exists():
-                p = ws_p
+        p = _resolve_read_path(path)
+        if not p.exists():
+            return f"File does not exist: {path}"
         content = p.read_text(encoding="utf-8", errors="replace")
         limit = CONFIG["file_read_limit"]
         if len(content) > limit:
-            content = content[:limit] + f"\n\n… [truncated at {limit:,} chars]"
+            content = content[:limit] + f"\n\n[truncated at {limit:,} chars]"
         return content
     except Exception as e:
-        return f"❌ File read error: {e}"
+        return f"File read error: {e}"
 
 
 def write_file_fn(path: str, content: str) -> str:
     try:
-        p = Path(path).expanduser()
-        if not p.is_absolute():
-            p = Path(CONFIG["workspace_dir"]) / path
+        p = _resolve_write_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"✓ Wrote {len(content.encode()):,} bytes → {p}"
+        return f"Wrote {len(content.encode()):,} bytes to {p}"
     except Exception as e:
-        return f"❌ File write error: {e}"
+        return f"File write error: {e}"
+
+
+def append_file_fn(path: str, content: str) -> str:
+    try:
+        p = _resolve_write_path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(content)
+        return f"Appended {len(content.encode()):,} bytes to {p}"
+    except Exception as e:
+        return f"Append error: {e}"
 
 
 def list_dir_fn(path: str) -> str:
     try:
-        p = Path(path).expanduser()
-        if not p.is_absolute() and not p.exists():
-            ws_p = Path(CONFIG["workspace_dir"]) / path
-            if ws_p.exists():
-                p = ws_p
+        p = _resolve_read_path(path)
         if not p.exists():
-            return f"❌ Path does not exist: {path}"
-        rows = []
-        for item in sorted(p.iterdir()):
-            if item.is_dir():
-                rows.append(f"📁 {item.name}/")
-            else:
-                rows.append(f"📄 {item.name} ({item.stat().st_size:,} bytes)")
+            return f"Path does not exist: {path}"
+        rows = [f"{'Dir' if i.is_dir() else 'File'}: {i.name}" + (f" ({i.stat().st_size:,}b)" if i.is_file() else "") for i in sorted(p.iterdir())]
         return "\n".join(rows) if rows else "(empty directory)"
     except Exception as e:
-        return f"❌ List dir error: {e}"
+        return f"List dir error: {e}"
+
+
+def get_clipboard_fn() -> str:
+    try:
+        r = subprocess.run(["pbpaste"], capture_output=True, text=True)
+        return r.stdout or "(empty clipboard)"
+    except Exception as e:
+        return f"Clipboard read error: {e}"
+
+
+def set_clipboard_fn(text: str) -> str:
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        return f"Copied {len(text):,} chars to clipboard."
+    except Exception as e:
+        return f"Clipboard write error: {e}"
+
+
+def run_apple_script_fn(script: str) -> str:
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
+        output = (r.stdout + r.stderr).strip()
+        if r.returncode != 0 and not output:
+            return f"AppleScript failed (code {r.returncode})."
+        return output or "AppleScript executed."
+    except subprocess.TimeoutExpired:
+        return "AppleScript timed out."
+    except Exception as e:
+        return f"AppleScript error: {e}"
+
+
+def create_note_fn(title: str, content: str) -> str:
+    lines = [l.strip() for l in content.split("\n") if l.strip()]
+    bullets = "".join(f"<li>{l.lstrip('-*• ')}</li>" for l in lines)
+    html = f"<h1>{title}</h1><ul>{bullets}</ul>"
+    clean_html = html.replace("\\", "\\\\").replace('"', '\\"')
+    script = ('tell application "Notes"\ntell default account\n' +
+               f'make new note at default folder with properties {{body:"{clean_html}"}}\n' +
+               'end tell\nend tell')
+    result = run_apple_script_fn(script)
+    return f'Apple Note created: "{title}"' if "error" not in result.lower() else result
 
 
 def search_web_fn(query: str) -> str:
     try:
         if not DDGS:
-            return "❌ DuckDuckGo search library not available."
+            return "DuckDuckGo search library not available."
         results = DDGS().text(query, max_results=CONFIG["search_max_results"])
         if not results:
             return "No results found."
-        lines = [f"🔍 Search: {query}\n"]
+        lines = [f"Search: {query}\n"]
         for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r.get('title', 'No title')}")
-            lines.append(f"   {r.get('href', '')}")
-            lines.append(f"   {r.get('body', '')[:260]}\n")
+            lines.append(f"{i}. {r.get('title', 'No title')}\n   {r.get('href', '')}\n   {r.get('body', '')[:260]}\n")
         return "\n".join(lines)
     except Exception as e:
-        return f"❌ Search error: {e}"
+        return f"Search error: {e}"
 
 
 def read_url_fn(url: str) -> str:
@@ -515,19 +551,17 @@ def read_url_fn(url: str) -> str:
         text = (main or soup).get_text(separator="\n", strip=True)
         text = re.sub(r"\n{3,}", "\n\n", text)
         limit = CONFIG["url_read_limit"]
-        if len(text) > limit:
-            text = text[:limit] + f"\n\n… [truncated at {limit:,} chars]"
-        return text
+        return text[:limit] + (f"\n[truncated at {limit:,} chars]" if len(text) > limit else "")
     except requests.HTTPError as e:
-        return f"❌ HTTP {e.response.status_code}: {url}"
+        return f"HTTP {e.response.status_code}: {url}"
     except Exception as e:
-        return f"❌ URL read error: {e}"
+        return f"URL read error: {e}"
 
 
 def sleep_fn(seconds: int) -> str:
-    console.print(f"[blue]💤 Waiting {seconds}s...[/blue]")
+    console.print(f"[blue]Waiting {seconds}s...[/blue]")
     time.sleep(seconds)
-    return f"✓ Resumed. Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    return f"Resumed at {datetime.now().strftime('%H:%M:%S')}"
 
 # ═══════════════════════════════════════════════════════
 # PLUGIN SYSTEM
@@ -556,9 +590,9 @@ def get_dynamic_plugins() -> Dict[str, Any]:
                 spec.loader.exec_module(mod)
                 _plugin_cache[key] = mod
                 _plugin_mtimes[key] = mtime
-                console.print(f"[dim]🔌 Plugin (re)loaded: {py_file.name}[/dim]")
+                console.print(f"[dim]Plugin reloaded: {py_file.name}[/dim]")
             except Exception as e:
-                console.print(f"[red]⚠  Plugin [{py_file.name}] failed: {e}[/red]")
+                console.print(f"[red]Plugin [{py_file.name}] failed: {e}[/red]")
                 continue
         if hasattr(mod, "TOOL_SCHEMA") and hasattr(mod, "execute"):
             name = mod.TOOL_SCHEMA.get("function", {}).get("name", py_file.stem)
@@ -566,7 +600,7 @@ def get_dynamic_plugins() -> Dict[str, Any]:
     return plugins
 
 # ═══════════════════════════════════════════════════════
-# LLM INFERENCE & STREAMING
+# LLM INFERENCE
 # ═══════════════════════════════════════════════════════
 
 def estimate_tokens(text: str) -> int:
@@ -577,15 +611,19 @@ def context_tokens(messages: List[Dict]) -> int:
     return sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
 
 
+def check_ollama_health() -> bool:
+    try:
+        r = requests.get(f"{CONFIG['ollama_url']}/api/tags", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def stream_ollama(messages: List[Dict], temperature: Optional[float] = None):
     url = f"{CONFIG['ollama_url']}/api/chat"
     temp = temperature if temperature is not None else CONFIG["temperature"]
-    payload = {
-        "model": CONFIG["model"],
-        "messages": messages,
-        "stream": True,
-        "options": {"temperature": temp, "num_ctx": CONFIG["context_size"]},
-    }
+    payload = {"model": CONFIG["model"], "messages": messages, "stream": True,
+               "options": {"temperature": temp, "num_ctx": CONFIG["context_size"]}}
     try:
         with requests.post(url, json=payload, stream=True, timeout=180) as resp:
             resp.raise_for_status()
@@ -602,20 +640,19 @@ def stream_ollama(messages: List[Dict], temperature: Optional[float] = None):
                 except json.JSONDecodeError:
                     continue
     except Exception as e:
-        yield f"\n[⚠ LLM Error: {e}]"
+        yield f"\n[LLM Error: {e}]"
 
 
-def chat_ollama_blocking(messages: List[Dict], temperature: float = 0.1) -> Dict:
+def chat_ollama_blocking(messages: List[Dict], temperature: float = 0.1,
+                          format_schema: Optional[Dict] = None, timeout: int = 120) -> Dict:
     url = f"{CONFIG['ollama_url']}/api/chat"
-    payload = {
-        "model": CONFIG["model"],
-        "messages": messages,
-        "stream": False,
-        "options": {"temperature": temperature, "num_ctx": CONFIG["context_size"]},
-    }
+    payload = {"model": CONFIG["model"], "messages": messages, "stream": False,
+               "options": {"temperature": temperature, "num_ctx": CONFIG["context_size"]}}
+    if format_schema:
+        payload["format"] = format_schema
     for attempt in range(CONFIG["llm_retries"]):
         try:
-            resp = requests.post(url, json=payload, timeout=120)
+            resp = requests.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
             return resp.json().get("message", {"role": "assistant", "content": ""})
         except Exception as e:
@@ -625,8 +662,70 @@ def chat_ollama_blocking(messages: List[Dict], temperature: float = 0.1) -> Dict
                 return {"role": "assistant", "content": f"[LLM Error: {e}]"}
 
 # ═══════════════════════════════════════════════════════
-# CONVERSATION FAST-PATH (GREETINGS & GENERAL CHAT)
+# GRAMMAR GUARDRAIL — TOOL DISPATCH REPAIR
 # ═══════════════════════════════════════════════════════
+
+def repair_tool_dispatch(full_reply: str, available_tool_names: List[str],
+                          messages: List[Dict]) -> Optional[Tuple[str, Dict]]:
+    """
+    When XML extraction yields nothing, use grammar-enforced JSON to recover
+    the intended action. This is the #1 reliability improvement over v4.
+    """
+    if not CONFIG.get("enable_grammar_repair", True):
+        return None
+
+    schema = _build_repair_schema(available_tool_names)
+    repair_msgs = [
+        {"role": "system", "content": (
+            "You are a JSON intent extractor. An AI agent produced a response with "
+            "no detectable tool call. Analyse it and determine what it intended to do. "
+            "Return JSON with action (call_tool/transition/finish/respond), and relevant fields."
+        )},
+        {"role": "user", "content": (
+            f"Agent last response (tail):\n{full_reply[-600:]}\n\n"
+            f"Available tools: {available_tool_names}\n"
+            "What did the agent intend next?"
+        )}
+    ]
+    try:
+        resp = chat_ollama_blocking(repair_msgs, temperature=0.0, format_schema=schema,
+                                    timeout=CONFIG.get("grammar_repair_timeout", 45))
+        data = json.loads(resp.get("content", "{}"))
+        action = data.get("action", "respond")
+
+        if action == "call_tool":
+            tool = data.get("tool_name")
+            args = data.get("tool_args") or {}
+            if tool and tool in available_tool_names:
+                logger.grammar_repair(True, len(full_reply))
+                console.print(f"[dim yellow]Grammar repair: {tool}({json.dumps(args)[:80]})[/dim yellow]")
+                return (tool, args)
+        elif action == "transition":
+            state = data.get("next_state", "")
+            if state in ("EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"):
+                logger.grammar_repair(True, len(full_reply))
+                return ("__transition__", {"state": state})
+        elif action == "finish":
+            summary = data.get("finish_summary", "Task complete.")
+            logger.grammar_repair(True, len(full_reply))
+            return ("finish", {"summary": summary})
+    except Exception as e:
+        console.print(f"[dim red]Grammar repair error: {e}[/dim red]")
+
+    logger.grammar_repair(False, len(full_reply))
+    return None
+
+# ═══════════════════════════════════════════════════════
+# INTENT CLASSIFICATION (Two-Tier)
+# ═══════════════════════════════════════════════════════
+
+_GREETING_SET = {
+    "hi", "hello", "hey", "howdy", "sup", "yo", "good morning", "good evening",
+    "good afternoon", "who are you", "what are you", "what can you do", "help",
+    "what tools do you have", "thanks", "thank you", "cool", "nice", "awesome",
+    "great", "ok", "okay", "bye", "goodbye"
+}
+
 
 def is_conversational(text: str) -> bool:
     if not CONFIG.get("enable_intent_gating", True):
@@ -634,38 +733,51 @@ def is_conversational(text: str) -> bool:
     t = text.strip().lower().rstrip("!?.")
     if not t:
         return True
-    GREETINGS = {
-        "hi", "hello", "hey", "howdy", "sup", "yo", "good morning", "good evening",
-        "good afternoon", "who are you", "what are you", "what can you do", "help",
-        "what are your tools", "what tools do you have", "thanks", "thank you",
-        "cool", "nice", "awesome", "great", "ok", "okay"
-    }
-    if t in GREETINGS:
+    # Tier 1: keyword fast-path (zero latency)
+    if t in _GREETING_SET:
         return True
     words = t.split()
-    if len(words) <= 3 and words[0] in {"hi", "hello", "hey", "yo"}:
+    if len(words) <= 2 and words[0] in {"hi", "hello", "hey", "yo"}:
         return True
+    # Tier 2: LLM grammar classification (for short ambiguous messages)
+    if CONFIG.get("intent_use_grammar", True) and 3 <= len(words) <= 12:
+        try:
+            resp = chat_ollama_blocking(
+                messages=[
+                    {"role": "system", "content": (
+                        "Classify as CHAT or TASK. "
+                        "CHAT = greeting, casual Q&A, small talk, knowledge question with no computer action needed. "
+                        "TASK = any request to do something on the computer, create a file, search the web, run code."
+                    )},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.0, format_schema=INTENT_SCHEMA,
+                timeout=CONFIG.get("intent_timeout", 8)
+            )
+            data = json.loads(resp.get("content", "{}"))
+            return data.get("intent", "TASK") == "CHAT"
+        except Exception:
+            pass
     return False
 
+# ═══════════════════════════════════════════════════════
+# CONVERSATION FAST-PATH
+# ═══════════════════════════════════════════════════════
 
 def handle_conversation(user_input: str, messages: List[Dict]) -> None:
-    chat_prompt = [
-        {"role": "system", "content": CHAT_PROMPT},
-        {"role": "user", "content": user_input}
-    ]
+    chat_prompt = [{"role": "system", "content": CHAT_PROMPT}, {"role": "user", "content": user_input}]
     console.print()
     full_reply = ""
     with Live(console=console, refresh_per_second=12, transient=False) as live:
-        live.update(Panel("[dim]Thinking...[/dim]", title="[bold cyan]🤖 AutoAgent[/bold cyan]", border_style="cyan"))
+        live.update(Panel("[dim]Thinking...[/dim]", title="[bold cyan]AutoAgent[/bold cyan]", border_style="cyan"))
         for chunk in stream_ollama(chat_prompt, temperature=0.7):
             full_reply += chunk
-            live.update(Panel(Markdown(full_reply), title="[bold cyan]🤖 AutoAgent[/bold cyan]", border_style="cyan"))
-
+            live.update(Panel(Markdown(full_reply), title="[bold cyan]AutoAgent[/bold cyan]", border_style="cyan"))
     messages.append({"role": "user", "content": user_input})
     messages.append({"role": "assistant", "content": full_reply})
 
 # ═══════════════════════════════════════════════════════
-# CONTEXT MANAGEMENT (SMART COMPRESSION)
+# SMART CONTEXT COMPRESSION
 # ═══════════════════════════════════════════════════════
 
 def smart_compress(messages: List[Dict]) -> List[Dict]:
@@ -673,100 +785,89 @@ def smart_compress(messages: List[Dict]) -> List[Dict]:
     keep = CONFIG["keep_recent"]
     if len(messages) <= threshold:
         return messages
-
     sys_msg = messages[0]
     to_compress = messages[1:-keep]
     recent = messages[-keep:]
-
     if CONFIG["enable_smart_compress"] and to_compress:
-        snippet = "\n".join(
-            f"{m['role'].upper()}: {str(m.get('content', ''))[:300]}"
-            for m in to_compress
-        )
-        summary_req = [
-            {"role": "system", "content": (
-                "Summarise this agent conversation in 4-5 bullet points. "
-                "Include: tasks done, key results, errors. One line per bullet. Output ONLY bullets."
-            )},
-            {"role": "user", "content": snippet},
-        ]
-        resp = chat_ollama_blocking(summary_req)
+        snippet = "\n".join(f"{m['role'].upper()}: {str(m.get('content', ''))[:300]}" for m in to_compress)
+        resp = chat_ollama_blocking([
+            {"role": "system", "content": "Summarise in 4-5 bullet points: tasks done, key results, errors. Output ONLY bullets."},
+            {"role": "user", "content": snippet}
+        ])
         summary = resp.get("content", "").strip()
         if summary:
             compressed = [sys_msg, {"role": "system", "content": f"[COMPRESSED HISTORY]\n{summary}"}] + recent
-            console.print(f"[dim]⚡ Compressed context: {len(messages)} → {len(compressed)} messages[/dim]")
+            console.print(f"[dim]Context compressed: {len(messages)} -> {len(compressed)} msgs[/dim]")
             return compressed
     return [sys_msg] + recent
 
 # ═══════════════════════════════════════════════════════
-# XML TOOL CALL EXTRACTION & ROUTING
+# XML TOOL CALL EXTRACTION (with deduplication)
 # ═══════════════════════════════════════════════════════
 
-def _parse_inner_args(inner_xml: str) -> Dict[str, str]:
-    args = {}
-    inner_matches = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)
-    if inner_matches:
-        for arg_name, arg_val in inner_matches:
-            args[arg_name] = arg_val.strip()
-    return args
+_POSITIONAL_MAP: Dict[str, str] = {
+    "execute_python": "code", "run_command": "command", "run_apple_script": "script",
+    "search_web": "query", "read_url": "url", "read_file": "path", "list_directory": "path",
+    "sleep": "seconds", "search_memory": "query", "ask_user": "question",
+    "open_file": "path", "open_url": "url", "set_clipboard": "text", "finish": "summary",
+}
+_SKIP_TAGS = {"transition", "scratchpad", "thought"}
+_NO_ARG_TOOLS = {"read_memory", "read_episodic", "get_clipboard"}
 
 
 def extract_tool_calls(text: str) -> List[Tuple[str, Dict]]:
     calls: List[Tuple[str, Dict]] = []
-    matches = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', text, re.DOTALL)
-    for name, inner_xml in matches:
-        if name in ("transition", "scratchpad", "thought"):
+    seen_sigs: set = set()
+    for name, inner_xml in re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', text, re.DOTALL):
+        if name in _SKIP_TAGS:
             continue
-        args = _parse_inner_args(inner_xml)
+        # Parse nested args
+        args = {k: v.strip() for k, v in re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)}
         if not args:
             raw = inner_xml.strip()
-            if name == "execute_python":
-                args["code"] = raw
-            elif name == "run_command":
-                args["command"] = raw
-            elif name == "search_web":
-                args["query"] = raw
-            elif name == "read_url":
-                args["url"] = raw
-            elif name == "read_file":
-                args["path"] = raw
-            elif name == "list_directory":
-                args["path"] = raw
-            elif name == "sleep":
-                args["seconds"] = raw
-            elif name == "search_memory":
-                args["query"] = raw
-            elif name == "ask_user":
-                args["question"] = raw
-            elif name == "open_file":
-                args["path"] = raw
-            elif name == "open_url":
-                args["url"] = raw
-            elif name == "finish":
-                args["summary"] = raw
+            if name in _POSITIONAL_MAP:
+                args[_POSITIONAL_MAP[name]] = raw
+            elif name in _NO_ARG_TOOLS:
+                args = {}
+            elif name == "notify_user":
+                args = {"title": "AutoAgent", "message": raw}
+        # Deduplication
+        sig = f"{name}:{json.dumps(args, sort_keys=True)}"
+        if sig in seen_sigs:
+            console.print(f"[dim yellow]Duplicate tool skipped: {name}[/dim yellow]")
+            continue
+        seen_sigs.add(sig)
         calls.append((name, args))
     return calls
 
+# ═══════════════════════════════════════════════════════
+# TOOL ROUTING
+# ═══════════════════════════════════════════════════════
 
 def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
     ROUTES = {
-        "ask_user":       lambda: ask_user_fn(args.get("question", "")),
-        "finish":         lambda: finish_fn(args.get("summary", "")),
-        "open_file":      lambda: open_file_fn(args.get("path", "")),
-        "open_url":       lambda: open_url_fn(args.get("url", "")),
-        "notify_user":    lambda: notify_user_fn(args.get("title", "AutoAgent"), args.get("message", "Task completed.")),
-        "search_web":     lambda: search_web_fn(args.get("query", "")),
-        "read_url":       lambda: read_url_fn(args.get("url", "")),
-        "execute_python": lambda: execute_python_sandboxed(args.get("code", "")),
-        "run_command":    lambda: run_command_fn(args.get("command", "")),
-        "read_file":      lambda: read_file_fn(args.get("path", "")),
-        "write_file":     lambda: write_file_fn(args.get("path", ""), args.get("content", "")),
-        "list_directory": lambda: list_dir_fn(args.get("path", ".")),
-        "sleep":          lambda: sleep_fn(int(args.get("seconds", 5))),
-        "read_memory":    lambda: read_memory_fn(),
-        "write_memory":   lambda: write_memory_fn(args.get("key", ""), args.get("value", "")),
-        "search_memory":  lambda: search_memory_fn(args.get("query", "")),
-        "read_episodic":  lambda: read_episodic_fn(),
+        "ask_user":          lambda: ask_user_fn(args.get("question", "")),
+        "finish":            lambda: finish_fn(args.get("summary", "")),
+        "open_file":         lambda: open_file_fn(args.get("path", "")),
+        "open_url":          lambda: open_url_fn(args.get("url", "")),
+        "notify_user":       lambda: notify_user_fn(args.get("title", "AutoAgent"), args.get("message", "Done.")),
+        "search_web":        lambda: search_web_fn(args.get("query", "")),
+        "read_url":          lambda: read_url_fn(args.get("url", "")),
+        "execute_python":    lambda: execute_python_sandboxed(args.get("code", "")),
+        "run_command":       lambda: run_command_fn(args.get("command", "")),
+        "read_file":         lambda: read_file_fn(args.get("path", "")),
+        "write_file":        lambda: write_file_fn(args.get("path", ""), args.get("content", "")),
+        "append_file":       lambda: append_file_fn(args.get("path", ""), args.get("content", "")),
+        "list_directory":    lambda: list_dir_fn(args.get("path", ".")),
+        "get_clipboard":     lambda: get_clipboard_fn(),
+        "set_clipboard":     lambda: set_clipboard_fn(args.get("text", "")),
+        "run_apple_script":  lambda: run_apple_script_fn(args.get("script", "")),
+        "create_note":       lambda: create_note_fn(args.get("title", "Note"), args.get("content", "")),
+        "sleep":             lambda: sleep_fn(int(args.get("seconds", 5))),
+        "read_memory":       lambda: read_memory_fn(),
+        "write_memory":      lambda: write_memory_fn(args.get("key", ""), args.get("value", "")),
+        "search_memory":     lambda: search_memory_fn(args.get("query", "")),
+        "read_episodic":     lambda: read_episodic_fn(),
     }
     if tool_name in ROUTES:
         return ROUTES[tool_name]()
@@ -774,9 +875,24 @@ def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
         try:
             return str(plugins[tool_name].execute(args))
         except Exception as e:
-            return f"❌ Plugin error [{tool_name}]: {e}"
-    available = list(ROUTES) + list(plugins)
-    return f"❌ Unknown tool '{tool_name}'. Available: {available}"
+            return f"Plugin error [{tool_name}]: {e}"
+    return f"Unknown tool '{tool_name}'. Available: {list(ROUTES) + list(plugins)}"
+
+# ═══════════════════════════════════════════════════════
+# PARALLEL TOOL EXECUTION
+# ═══════════════════════════════════════════════════════
+
+_SEQUENTIAL_TOOLS = {
+    "write_file", "append_file", "write_memory", "run_command", "execute_python",
+    "open_file", "open_url", "notify_user", "ask_user", "finish", "set_clipboard",
+    "run_apple_script", "create_note", "sleep"
+}
+
+
+def _timed_route(name: str, args: Dict, plugins: Dict) -> Tuple[str, str, float]:
+    t0 = time.time()
+    result = route_tool(name, args, plugins)
+    return (name, str(result), time.time() - t0)
 
 # ═══════════════════════════════════════════════════════
 # TASK PLANNER
@@ -797,15 +913,10 @@ def should_plan(task: str) -> bool:
 
 
 def make_plan(task: str) -> str:
-    msgs = [
-        {"role": "system", "content": (
-            "You are a master task planner for an AI agent on macOS. Given a task, produce a clean, "
-            "numbered 3 to 5 step execution roadmap. Be direct and concrete. "
-            "Output ONLY the numbered steps — no intro or conversational filler."
-        )},
-        {"role": "user", "content": f"Task: {task}"},
-    ]
-    resp = chat_ollama_blocking(msgs, temperature=0.1)
+    resp = chat_ollama_blocking([
+        {"role": "system", "content": "You are a master task planner for an AI agent. Given a task, produce a numbered 3-5 step roadmap. Be concrete. Output ONLY numbered steps."},
+        {"role": "user", "content": f"Task: {task}"}
+    ], temperature=0.1)
     return resp.get("content", "").strip()
 
 # ═══════════════════════════════════════════════════════
@@ -813,7 +924,7 @@ def make_plan(task: str) -> str:
 # ═══════════════════════════════════════════════════════
 
 _obs_counter = 0
-_OBS_CONTENT_HASH: Dict[str, str] = {}
+_OBS_HASH: Dict[str, str] = {}
 
 
 def _prepare_observation(tool_name: str, result: str) -> str:
@@ -821,68 +932,71 @@ def _prepare_observation(tool_name: str, result: str) -> str:
     limit = CONFIG["observation_limit"]
     if not CONFIG["offload_large_obs"] or len(result) <= limit:
         return result
-
-    import hashlib
     content_hash = hashlib.md5(result.encode()).hexdigest()[:12]
-
-    if content_hash in _OBS_CONTENT_HASH:
-        existing = _OBS_CONTENT_HASH[content_hash]
-        short = result[:limit]
-        return (
-            f"{short}\n\n"
-            f"… [SAME CONTENT as before — already saved to {existing}\n"
-            f"You have already seen this data. Proceed with your action.]"
-        )
-
+    if content_hash in _OBS_HASH:
+        return result[:limit] + f"\n[Same content as {_OBS_HASH[content_hash]} — already processed.]"
     _obs_counter += 1
     ws = Path(CONFIG["workspace_dir"])
     ws.mkdir(parents=True, exist_ok=True)
     out_path = ws / f"obs_{_obs_counter}_{tool_name}.txt"
     try:
         out_path.write_text(result, encoding="utf-8")
-        _OBS_CONTENT_HASH[content_hash] = str(out_path)
-        short = result[:limit]
-        return (
-            f"{short}\n\n"
-            f"… [OUTPUT TRUNCATED — full result ({len(result):,} chars) offloaded to disk:\n"
-            f"  {out_path}\n"
-            f"Use read_file if you need specific sections.]"
-        )
+        _OBS_HASH[content_hash] = str(out_path)
+        return result[:limit] + f"\n[Full output ({len(result):,} chars) saved to {out_path}. Use read_file for specific sections.]"
     except Exception:
-        return result[:limit] + f"\n… [truncated at {limit} chars]"
+        return result[:limit] + f"\n[truncated at {limit} chars]"
 
 # ═══════════════════════════════════════════════════════
-# AUTONOMOUS REACT STATE MACHINE LOOP
+# REACT STATE MACHINE LOOP
 # ═══════════════════════════════════════════════════════
+
+def _format_tools_for_prompt(active_tools: List[Dict]) -> str:
+    parts = []
+    for t in active_tools:
+        if not isinstance(t, dict):
+            continue
+        if "schema" in t:
+            parts.append(f"- {t['name']}: {t['description']}\n  Usage: {t['schema']}")
+        elif "function" in t:
+            fn = t["function"]
+            parts.append(f"- {fn.get('name', '?')}: {fn.get('description', '')}")
+    return "\n\n".join(parts)
+
+
+def _build_system_content(active_tools: List[Dict]) -> str:
+    return (SYSTEM_PROMPT_TEMPLATE
+            .replace("{TOOLS_XML}", _format_tools_for_prompt(active_tools))
+            .replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
+            .replace("{MEMORY_CONTEXT}", get_memory_context()))
+
 
 def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
     current_state = "EVALUATE"
     step = 0
     max_steps = CONFIG["max_steps"]
-    
     tool_sig_counts: Counter = Counter()
     recent_tools: deque = deque(maxlen=8)
+
+    current_plugins = get_dynamic_plugins()
+    available_tool_names = [t["name"] for t in BASE_TOOLS] + list(current_plugins.keys())
 
     while True:
         step += 1
         if step > max_steps:
-            console.print(f"\n[bold red]⛔ Reached safety step limit ({max_steps}).[/bold red]")
-            messages.append({
-                "role": "system",
-                "content": f"[SYSTEM: Maximum step limit reached. Provide a final summary of what was accomplished.]",
-            })
-            with console.status("[yellow]Generating final summary...[/yellow]", spinner="dots"):
-                resp = chat_ollama_blocking(messages)
+            console.print(f"\n[bold red]Reached step limit ({max_steps}).[/bold red]")
+            messages.append({"role": "system", "content": "[SYSTEM: Step limit reached. Call <finish> immediately.]"})
+            resp = chat_ollama_blocking(messages)
             summary = resp.get("content", "")
             if summary:
-                console.print(Panel(Markdown(summary), title="[bold yellow]Task Summary[/bold yellow]", border_style="yellow"))
+                console.print(Panel(Markdown(summary), title="[yellow]Summary[/yellow]", border_style="yellow"))
                 messages.append({"role": "assistant", "content": summary})
             break
 
-        state_prompt = f"[SYSTEM: You are currently in STATE: {current_state}. Please think, act, and transition.]"
+        state_prompt = (f"[SYSTEM: STATE={current_state} | Step {step}/{max_steps}. "
+                        "Think, then call ONE tool or transition. If task is done, call <finish> now.]")
         messages.append({"role": "user", "content": state_prompt})
         messages = smart_compress(messages)
-        print_status(messages)
+        print_status(messages, step, max_steps)
 
         full_reply = ""
         t0 = time.time()
@@ -890,23 +1004,19 @@ def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
         if CONFIG["enable_streaming"]:
             with Live(console=console, refresh_per_second=10, transient=False) as live:
                 live.update(Panel("[dim]Thinking...[/dim]",
-                                  title=f"[bold yellow]🤖 AutoAgent [dim]({current_state})[/dim][/bold yellow]",
+                                  title=f"[bold yellow]AutoAgent [{current_state} step {step}][/bold yellow]",
                                   border_style="yellow"))
                 for chunk in stream_ollama(messages):
                     full_reply += chunk
-                    visible_reply = full_reply.replace("<thought>", "> **💭 Thought:**\n> ").replace("</thought>", "\n")
-                    display = Markdown(visible_reply) if len(visible_reply) < 4000 else visible_reply[-2000:]
-                    live.update(Panel(display,
-                                      title=f"[bold yellow]🤖 AutoAgent [dim]({current_state})[/dim][/bold yellow]",
-                                      border_style="yellow"))
+                    visible = full_reply.replace("<thought>", "> Thought: ").replace("</thought>", "\n")
+                    display = Markdown(visible) if len(visible) < 4000 else visible[-2000:]
+                    live.update(Panel(display, title=f"[bold yellow]AutoAgent [{current_state} step {step}][/bold yellow]", border_style="yellow"))
         else:
-            with console.status(f"[yellow]🤖 Reasoning in {current_state}…[/yellow]", spinner="dots"):
+            with console.status(f"[yellow]Reasoning ({current_state} step {step})...[/yellow]", spinner="dots"):
                 resp = chat_ollama_blocking(messages)
                 full_reply = resp.get("content", "")
-            visible_reply = full_reply.replace("<thought>", "> **💭 Thought:**\n> ").replace("</thought>", "\n")
-            console.print(Panel(Markdown(visible_reply),
-                                title=f"[bold yellow]🤖 AutoAgent ({current_state})[/bold yellow]",
-                                border_style="yellow"))
+            visible = full_reply.replace("<thought>", "> Thought: ").replace("</thought>", "\n")
+            console.print(Panel(Markdown(visible), title=f"[yellow]AutoAgent [{current_state} step {step}][/yellow]", border_style="yellow"))
 
         dur_llm = time.time() - t0
         logger.llm_call(dur_llm, estimate_tokens(full_reply))
@@ -915,104 +1025,134 @@ def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
         transition_match = re.search(r'<transition>(.*?)</transition>', full_reply, re.IGNORECASE)
         tool_calls = extract_tool_calls(full_reply)
 
-        # Check for explicit finish tool call
+        # Finish tool check
         finish_call = next(((t, a) for t, a in tool_calls if t == "finish"), None)
         if finish_call:
             summary = finish_call[1].get("summary", "")
-            console.print(Panel(
-                Markdown(summary),
-                title="[bold green]✔ Task Deliverable Completed[/bold green]",
-                border_style="green"
-            ))
-            notify_user_fn("AutoAgent Task Complete", "Your requested deliverable is ready!")
+            console.print(Panel(Markdown(summary), title="[bold green]Task Complete[/bold green]", border_style="green"))
+            notify_user_fn("AutoAgent", "Task complete!")
             break
 
-        # Natural conclusion or answer without XML tags
+        # No tool calls and no transition
         if not tool_calls and not transition_match:
             clean_reply = re.sub(r'<thought>.*?</thought>', '', full_reply, flags=re.DOTALL).strip()
-            if clean_reply and current_state in ("ACTION", "SYNTHESIS", "EVALUATE") and step > 1:
-                console.print(Panel(
-                    Markdown(clean_reply),
-                    title="[bold green]✔ Task Response[/bold green]",
-                    border_style="green"
-                ))
-                break
-            else:
-                messages.append({"role": "user", "content": "SYSTEM GUIDANCE: Use <tool_name>...</tool_name> to act, or <transition>STATE</transition> to move between states, or <finish> to conclude."})
-                continue
+
+            # Try grammar repair
+            if CONFIG.get("enable_grammar_repair", True):
+                repaired = repair_tool_dispatch(full_reply, available_tool_names, messages)
+                if repaired:
+                    rname, rargs = repaired
+                    if rname == "__transition__":
+                        new_state = rargs.get("state", current_state)
+                        console.print(f"[magenta]Grammar-repaired transition -> {new_state}[/magenta]")
+                        current_state = new_state
+                        if current_state == "DONE":
+                            break
+                        continue
+                    else:
+                        tool_calls = [(rname, rargs)]
+                else:
+                    if clean_reply and current_state in ("ACTION", "SYNTHESIS", "EVALUATE") and step > 1:
+                        console.print(Panel(Markdown(clean_reply), title="[green]Response[/green]", border_style="green"))
+                        break
+                    else:
+                        messages.append({"role": "user", "content":
+                            "SYSTEM: No tool call or transition detected. Use <tool_name>...</tool_name> "
+                            "to call a tool, <transition>STATE</transition> to change state, or "
+                            "<finish><summary>...</summary></finish> to conclude."})
+                        continue
 
         if tool_calls and transition_match:
-            transition_match = None  # prioritize tool execution
+            transition_match = None  # tools take priority
 
         current_plugins = get_dynamic_plugins()
+        available_tool_names = [t["name"] for t in BASE_TOOLS] + list(current_plugins.keys())
 
-        if transition_match:
+        if transition_match and not tool_calls:
             new_state = transition_match.group(1).strip().upper()
             if new_state in ["EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"]:
                 current_state = new_state
-                console.print(f"[bold magenta]🔄 Transitioning to {current_state}[/bold magenta]")
+                console.print(f"[magenta]-> {current_state}[/magenta]")
                 if current_state == "DONE":
-                    clean_reply = re.sub(r'<thought>.*?</thought>', '', full_reply, flags=re.DOTALL).strip()
-                    if clean_reply:
-                        console.print(Panel(Markdown(clean_reply), title="[bold green]✔ Deliverable Complete[/bold green]", border_style="green"))
+                    clean = re.sub(r'<thought>.*?</thought>', '', full_reply, flags=re.DOTALL).strip()
+                    if clean:
+                        console.print(Panel(Markdown(clean), title="[green]Done[/green]", border_style="green"))
                     break
             else:
-                messages.append({"role": "user", "content": f"SYSTEM WARNING: Invalid state '{new_state}'. Valid states: EVALUATE, RESEARCH, SYNTHESIS, ACTION, DONE."})
+                messages.append({"role": "user", "content": f"SYSTEM: Invalid state '{new_state}'. Valid: EVALUATE, RESEARCH, SYNTHESIS, ACTION, DONE."})
             continue
 
         if tool_calls:
             observations = []
             break_loop = False
 
+            # Loop prevention
             for tool_name, tool_args in tool_calls:
                 sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
                 tool_sig_counts[sig] += 1
                 recent_tools.append(tool_name)
 
-                # Hard Loop Prevention with Human Intervention
                 if tool_sig_counts[sig] > CONFIG["max_repeat_count"]:
-                    console.print(f"\n[bold red]⚠ Loop Intercepted: '{tool_name}' repeated {tool_sig_counts[sig]}× without progress.[/bold red]")
+                    console.print(f"\n[bold red]Loop: '{tool_name}' repeated {tool_sig_counts[sig]}x with same args.[/bold red]")
                     console.print(Panel(
-                        f"The model is attempting to repeat [bold yellow]{tool_name}[/bold yellow] with identical arguments.\n"
-                        f"Arguments: [dim]{json.dumps(tool_args)}[/dim]\n\n"
-                        f"[cyan]Press Enter to stop and review, or type guidance to redirect the agent.[/cyan]",
-                        title="[bold red]Self-Healing Intercept[/bold red]",
-                        border_style="red"
-                    ))
+                        f"Agent repeating [yellow]{tool_name}[/yellow] with no progress.\n"
+                        f"Args: {json.dumps(tool_args)}\n\nPress Enter to pause or type guidance.",
+                        title="[red]Loop Intercepted[/red]", border_style="red"))
                     try:
-                        guidance = input("👤 Human Guidance: ").strip()
+                        guidance = input("Human Guidance: ").strip()
                     except (EOFError, KeyboardInterrupt):
                         guidance = ""
                     if not guidance:
-                        console.print("[yellow]Task paused by user.[/yellow]")
                         break_loop = True
                         break
-                    else:
-                        tool_sig_counts.clear()
-                        observations.append(f"OBSERVATION: Human supervisor intervened: {guidance}")
-                        continue
+                    tool_sig_counts.clear()
+                    observations.append(f"OBSERVATION: Human redirected: {guidance}")
+                    continue
 
-                console.print(f"╭{'─'*31} Tool Call {'─'*31}╮")
-                console.print(f"│ 🔧 {tool_name:<73}│")
-                console.print(f"╰{'─'*75}╯")
+            if break_loop:
+                break
 
-                t_tool = time.time()
-                result = route_tool(tool_name, tool_args, current_plugins)
-                dur_tool = time.time() - t_tool
+            # Split into parallel (read-only) and sequential (side-effect) calls
+            parallel_calls = [(i, n, a) for i, (n, a) in enumerate(tool_calls) if n not in _SEQUENTIAL_TOOLS]
+            sequential_calls = [(i, n, a) for i, (n, a) in enumerate(tool_calls) if n in _SEQUENTIAL_TOOLS]
 
-                logger.tool_call(tool_name, tool_args, str(result), dur_tool)
+            results: Dict[int, Tuple[str, str, float]] = {}
 
-                preview = str(result)
-                if len(preview) > 1200:
-                    preview = preview[:1200] + f"\n… [{len(str(result)):,} chars total]"
-                console.print(Panel(f"[green]👁 Observation[/green] [dim]({dur_tool:.2f}s)[/dim]\n\n{preview}", border_style="green"))
+            # Run read-only tools in parallel
+            if parallel_calls and len(parallel_calls) > 1 and CONFIG.get("enable_parallel_tools"):
+                console.print(f"[dim cyan]Running {len(parallel_calls)} tools in parallel[/dim cyan]")
+                workers = min(CONFIG.get("max_parallel_workers", 4), len(parallel_calls))
+                with ThreadPoolExecutor(max_workers=workers) as exc:
+                    futures = {exc.submit(_timed_route, n, a, current_plugins): i for i, n, a in parallel_calls}
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            results[idx] = future.result()
+                        except Exception as e:
+                            results[idx] = (tool_calls[idx][0], f"Parallel error: {e}", 0.0)
+            else:
+                for i, n, a in parallel_calls:
+                    results[i] = _timed_route(n, a, current_plugins)
 
-                if str(result).startswith("TASK_COMPLETED:"):
+            # Run sequential tools
+            for i, n, a in sequential_calls:
+                console.print(f"[cyan]Tool: {n}[/cyan]")
+                results[i] = _timed_route(n, a, current_plugins)
+
+            # Display results & collect observations
+            for i in range(len(tool_calls)):
+                if i not in results:
+                    continue
+                t_name, t_result, t_dur = results[i]
+                logger.tool_call(t_name, tool_calls[i][1], t_result, t_dur)
+                preview = t_result[:1200] + (f"\n[{len(t_result):,} chars total]" if len(t_result) > 1200 else "")
+                console.print(Panel(f"[green]Observation ({t_dur:.2f}s)[/green]\n\n{preview}", border_style="green"))
+
+                if t_result.startswith("TASK_COMPLETED:"):
                     break_loop = True
                     break
 
-                context_result = _prepare_observation(tool_name, str(result))
-                observations.append(f"OBSERVATION from {tool_name}:\n{context_result}")
+                observations.append(f"OBSERVATION from {t_name}:\n{_prepare_observation(t_name, t_result)}")
 
             if break_loop:
                 break
@@ -1020,21 +1160,19 @@ def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
             if observations:
                 messages.append({"role": "user", "content": "\n\n---\n\n".join(observations)})
 
-            # Update system prompt with active tools
-            active_tools = list(BASE_TOOLS) + [p.TOOL_SCHEMA for p in current_plugins.values()]
-            tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
-            messages[0]["content"] = SYSTEM_PROMPT_TEMPLATE.replace("{TOOLS_XML}", tools_xml_str).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
+            # Refresh system prompt
+            active_tools = build_active_tools()
+            messages[0]["content"] = _build_system_content(active_tools)
 
     return messages
 
 # ═══════════════════════════════════════════════════════
-# INPUT & CLI STATUS
+# UI HELPERS
 # ═══════════════════════════════════════════════════════
 
 def poll_input() -> str:
-    sys.stdout.write("\n👤 You: ")
+    sys.stdout.write("\n You: ")
     sys.stdout.flush()
-
     while True:
         inbox = Path("inbox.txt")
         if inbox.exists():
@@ -1042,12 +1180,11 @@ def poll_input() -> str:
                 content = inbox.read_text(encoding="utf-8").strip()
                 if content:
                     inbox.write_text("", encoding="utf-8")
-                    console.print("\n[bold green]📥 Task from inbox.txt[/bold green]")
+                    console.print("\n[green]Task from inbox.txt[/green]")
                     logger.user_input(f"[inbox] {content}")
                     return content
             except Exception:
                 pass
-
         try:
             readable, _, _ = select.select([sys.stdin], [], [], 0.5)
             if readable:
@@ -1064,19 +1201,17 @@ def poll_input() -> str:
                 return "exit"
 
 
-def print_status(messages: List[Dict]) -> None:
+def print_status(messages: List[Dict], step: int = 0, max_steps: int = 0) -> None:
     toks = context_tokens(messages)
     max_t = CONFIG["context_size"]
     pct = min(toks / max_t * 100, 100)
     bar_w = 20
     filled = int(bar_w * pct / 100)
-    bar = "█" * filled + "░" * (bar_w - filled)
+    bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
     color = "green" if pct < 50 else "yellow" if pct < 80 else "red"
-    plugins = get_dynamic_plugins()
-    console.print(
-        f"[dim]Context [{color}]{bar}[/{color}] ~{toks:,} tokens (~{pct:.0f}%) | "
-        f"Msgs: {len(messages)} | Plugins: {len(plugins)} | Model: {CONFIG['model']}[/dim]"
-    )
+    step_info = f" | Step {step}/{max_steps}" if step else ""
+    console.print(f"[dim]Context [{color}]{bar}[/{color}] ~{toks:,} tok (~{pct:.0f}%) | "
+                  f"Msgs: {len(messages)} | Model: {CONFIG['model']}{step_info}[/dim]")
 
 
 def build_active_tools() -> List[Dict]:
@@ -1087,24 +1222,44 @@ def build_active_tools() -> List[Dict]:
 # ═══════════════════════════════════════════════════════
 
 def main() -> None:
+    # Health check
+    with console.status("[cyan]Connecting to Ollama...[/cyan]", spinner="dots"):
+        online = check_ollama_health()
+    if not online:
+        console.print(Panel(
+            f"[red]Ollama is offline at {CONFIG['ollama_url']}[/red]\n\n"
+            "Start it with: [bold]ollama serve[/bold]\nThen restart AutoAgent.",
+            title="[red]Connection Error[/red]", border_style="red"))
+        sys.exit(1)
+
     active_tools = build_active_tools()
     plugin_count = len(active_tools) - len(BASE_TOOLS)
 
     console.print()
     console.print(Panel.fit(
-        "[bold cyan]⚡ AutoAgent v4.0 — Apple Silicon M4 Workstation Runtime[/bold cyan]\n"
-        "[dim]Closed-Loop ReAct · Human-in-the-Loop · Intent Fast-Path · macOS Native[/dim]\n\n"
-        f"• [bold white]Model:[/bold white] [green]{CONFIG['model']}[/green]   "
-        f"• [bold white]Context:[/bold white] [green]{CONFIG['context_size']:,} tokens[/green]   "
-        f"• [bold white]Tools:[/bold white] [green]{len(BASE_TOOLS)} base + {plugin_count} plugins[/green]\n"
-        f"• [bold white]Commands:[/bold white] [yellow]/help[/yellow], [yellow]/plan[/yellow], [yellow]/tools[/yellow], [yellow]/memory[/yellow], [yellow]/clear[/yellow], [yellow]/exit[/yellow]",
-        border_style="cyan",
-        title="[bold]AutoAgent[/bold]",
-    ))
+        "[bold cyan]AutoAgent v5.0 — Apple Silicon M4 Runtime[/bold cyan]\n"
+        "[dim]Grammar Guardrails | Parallel Tools | Session Persistence | Intent AI[/dim]\n\n"
+        f"Model: [green]{CONFIG['model']}[/green]  Context: [green]{CONFIG['context_size']:,}[/green] tokens  "
+        f"Tools: [green]{len(BASE_TOOLS)} base + {plugin_count} plugins[/green]\n"
+        "Commands: [yellow]/help /plan /tools /memory /session /history /clear /exit[/yellow]",
+        border_style="cyan", title="AutoAgent"))
 
-    tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
-    system_content = SYSTEM_PROMPT_TEMPLATE.replace("{TOOLS_XML}", tools_xml_str).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
+    system_content = _build_system_content(active_tools)
     messages: List[Dict] = [{"role": "system", "content": system_content}]
+
+    # Session restore
+    saved = load_session()
+    if saved and len(saved) > 1:
+        console.print(Panel(
+            f"[cyan]Saved session: [bold]{len(saved)} messages[/bold].[/cyan] Type [yellow]y[/yellow] to restore.",
+            title="[dim]Session Found[/dim]", border_style="dim"))
+        try:
+            if input("Restore? [y/N]: ").strip().lower() == "y":
+                messages = saved
+                messages[0]["content"] = system_content
+                console.print("[green]Session restored.[/green]")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
     try:
         while True:
@@ -1112,91 +1267,116 @@ def main() -> None:
             user_input = poll_input()
 
             if user_input.lower() in {"exit", "quit", "/exit", "/quit", "q"}:
-                console.print("\n[bold]👋 Standing down AutoAgent. Have a great day![/bold]")
+                save_session(messages)
+                console.print("\n[bold]Session saved. Goodbye![/bold]")
                 break
 
             if not user_input.strip():
                 continue
 
-            # ── Slash Commands ──────────────────────────────────────────────
             cmd = user_input.strip()
-            if cmd == "/clear" or cmd == "clear":
+
+            if cmd in ("/clear", "clear"):
                 os.system("clear")
                 continue
 
             if cmd == "/tools":
-                tbl = Table(title="Available AutoAgent Tools", border_style="cyan")
-                tbl.add_column("Tool Name", style="bold yellow")
+                tbl = Table(title="AutoAgent Tools", border_style="cyan")
+                tbl.add_column("Tool", style="bold yellow", no_wrap=True)
                 tbl.add_column("Description", style="white")
                 for t in build_active_tools():
                     if isinstance(t, dict):
-                        tbl.add_row(t.get("name", "plugin"), t.get("description", ""))
+                        name = t.get("name") or t.get("function", {}).get("name", "plugin")
+                        desc = t.get("description") or t.get("function", {}).get("description", "")
+                        tbl.add_row(name, desc)
                 console.print(tbl)
                 continue
 
             if cmd == "/memory":
-                mem = read_memory_fn()
-                console.print(Panel(mem, title="[cyan]Semantic Memory[/cyan]", border_style="cyan"))
+                console.print(Panel(read_memory_fn(), title="[cyan]Semantic Memory[/cyan]", border_style="cyan"))
+                continue
+
+            if cmd == "/history":
+                console.print(Panel(read_episodic_fn(), title="[cyan]Episodic History[/cyan]", border_style="cyan"))
+                continue
+
+            if cmd == "/session":
+                tbl = Table(title="Session Messages", border_style="blue")
+                tbl.add_column("#", style="dim", width=4)
+                tbl.add_column("Role", style="yellow", width=12)
+                tbl.add_column("Preview", style="white")
+                for i, m in enumerate(messages):
+                    tbl.add_row(str(i), m.get("role", "?"), str(m.get("content", ""))[:80].replace("\n", " "))
+                console.print(tbl)
+                console.print(f"[dim]Total: {len(messages)} msgs | ~{context_tokens(messages):,} tokens[/dim]")
+                continue
+
+            if cmd.startswith("/plan"):
+                task_for_plan = cmd[5:].strip()
+                if not task_for_plan:
+                    try:
+                        task_for_plan = input("Task to plan: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                if task_for_plan:
+                    with console.status("[cyan]Planning...[/cyan]", spinner="dots"):
+                        plan = make_plan(task_for_plan)
+                    console.print(Panel(plan, title="[cyan]Execution Roadmap[/cyan]", border_style="cyan"))
                 continue
 
             if cmd == "/help":
                 console.print(Panel(
-                    "• [bold yellow]Chat Naturally:[/bold yellow] Say 'hi', ask questions, discuss ideas.\n"
-                    "• [bold yellow]Give Tasks:[/bold yellow] 'Research Apple M4 benchmarks and save to excel'\n"
-                    "• [bold yellow]Human-in-the-Loop:[/bold yellow] If the agent needs details, it will ask you directly.\n"
-                    "• [bold yellow]macOS Actions:[/bold yellow] Generates files and opens them directly in Excel/Preview.\n"
-                    "• [bold yellow]Slash Commands:[/bold yellow] /tools, /plan, /memory, /clear, /exit",
-                    title="[bold cyan]AutoAgent Quick Guide[/bold cyan]",
-                    border_style="cyan"
-                ))
+                    "Chat naturally or give tasks. Slash commands:\n"
+                    "  /tools    - list all tools\n"
+                    "  /plan     - generate task roadmap\n"
+                    "  /memory   - view semantic memory\n"
+                    "  /history  - view past tasks\n"
+                    "  /session  - view current messages\n"
+                    "  /clear    - clear screen\n"
+                    "  /exit     - save & quit\n\n"
+                    "Drop a task in inbox.txt for background pickup.",
+                    title="[cyan]AutoAgent v5.0 Help[/cyan]", border_style="cyan"))
                 continue
 
-            # ── Intent Fast-Path for Conversation ───────────────────────────
+            # Intent classification
             if is_conversational(user_input):
                 handle_conversation(user_input, messages)
+                save_session(messages)
                 continue
 
-            # ── Dynamic Execution Plan for Complex Tasks ────────────────────
+            # Refresh tools + system prompt
             active_tools = build_active_tools()
-            tools_xml_str = "\n\n".join(json.dumps(t, indent=2) if isinstance(t, dict) and "schema" not in t else (t.get("schema") if isinstance(t, dict) else str(t)) for t in active_tools)
-            messages[0]["content"] = SYSTEM_PROMPT_TEMPLATE.replace(
-                "{TOOLS_XML}", tools_xml_str
-            ).replace("{WORKSPACE_DIR}", str(Path(CONFIG["workspace_dir"]).absolute()))
+            messages[0]["content"] = _build_system_content(active_tools)
 
+            # Auto-plan for complex tasks
             if should_plan(user_input):
-                with console.status("[cyan]Formulating execution roadmap...[/cyan]", spinner="dots"):
+                with console.status("[cyan]Formulating roadmap...[/cyan]", spinner="dots"):
                     plan = make_plan(user_input)
                 if plan:
-                    console.print(Panel(
-                        plan,
-                        title="[bold cyan]📋 Execution Roadmap[/bold cyan]",
-                        border_style="cyan"
-                    ))
-                    messages.append({"role": "system", "content": f"[EXECUTION ROADMAP]:\n{plan}\nExecute these steps methodically."})
+                    console.print(Panel(plan, title="[cyan]Execution Roadmap[/cyan]", border_style="cyan"))
+                    messages.append({"role": "system", "content": f"[EXECUTION ROADMAP]:\n{plan}\nExecute methodically."})
 
             messages.append({"role": "user", "content": user_input})
 
-            # ── Launch ReAct State Machine ──────────────────────────────────
             try:
                 messages = state_machine_loop(user_input, messages)
             except KeyboardInterrupt:
-                console.print("\n[bold red]⛔ Interrupted! Returning to prompt…[/bold red]")
-                messages.append({
-                    "role": "system",
-                    "content": "[SYSTEM: User interrupted the agent. Task halted.]",
-                })
+                console.print("\n[red]Interrupted![/red]")
+                messages.append({"role": "system", "content": "[SYSTEM: User interrupted. Task halted.]"})
             except Exception as e:
                 logger.error(str(e))
-                console.print(f"[red]Execution error: {e}[/red]")
+                console.print(f"[red]Error: {e}[/red]")
 
-            # Save episode outcome
             for m in reversed(messages):
                 if m["role"] == "assistant" and len(m.get("content", "")) > 20:
                     save_episode(user_input, m["content"])
                     break
 
+            save_session(messages)
+
     except KeyboardInterrupt:
-        console.print("\n[bold]👋 Goodbye![/bold]")
+        save_session(messages)
+        console.print("\n[bold]Session saved. Goodbye![/bold]")
 
 
 if __name__ == "__main__":

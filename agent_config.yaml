@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════╗
-# ║    AutoAgent v4.0 — Config (Qwen 2.5 on Apple M4)   ║
+# ║    AutoAgent v5.0 — Config (Qwen 2.5 on Apple M4)   ║
 # ╚══════════════════════════════════════════════════════╝
 
 # ── Model ──────────────────────────────────────────────
@@ -14,6 +14,8 @@ retry_delay: 2
 python_timeout: 30
 command_timeout: 30
 web_timeout: 15
+intent_timeout: 8
+grammar_repair_timeout: 45
 
 # ── Paths ──────────────────────────────────────────────
 workspace_dir: workspace
@@ -22,16 +24,24 @@ plugins_dir: plugins
 # ── UX & Intent ─────────────────────────────────────────
 enable_streaming: true
 enable_intent_gating: true
+intent_use_grammar: true
 
 # ── Planning ───────────────────────────────────────────
 enable_planning: true
 planning_threshold: 50
 
+# ── Grammar Guardrails ──────────────────────────────────
+enable_grammar_repair: true
+
+# ── Parallel Execution ──────────────────────────────────
+enable_parallel_tools: true
+max_parallel_workers: 4
+
 # ── Context — tuned for 7B/9B small models ─────────────
 # Small models lose coherence quickly with long histories.
 # Compress earlier and keep fewer recent messages.
 compress_threshold: 20
-keep_recent: 8               # was 10 — fewer recent messages = less noise
+keep_recent: 8               # fewer recent messages = less noise
 enable_smart_compress: true
 
 # ── Tool output limits ─────────────────────────────────
@@ -41,7 +51,7 @@ url_read_limit: 4000         # small models get lost in long web pages
 
 # ── Observation offloading ─────────────────────────────
 # Large tool outputs are saved to workspace/ and a short pointer
-# is given to the model instead.  Keeps context clean.
+# is given to the model instead. Keeps context clean.
 observation_limit: 3000      # chars fed back to LLM
 offload_large_obs: true      # enable file-based offloading
 
@@ -54,4 +64,6 @@ max_repeat_count: 2
 memory_file: agent_memory.json
 episodic_file: agent_episodic.json
 session_file: agent_session.json
+session_keep_messages: 40
 log_file: agent.log
+
