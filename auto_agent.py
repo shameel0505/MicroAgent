@@ -16,7 +16,7 @@ What's new:
   * Thread-safe logger
 """
 
-import os, sys, json, re, time, subprocess, importlib.util, select, hashlib, threading
+import os, sys, json, re, time, subprocess, importlib.util, select, hashlib, threading, ctypes
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +76,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "planning_threshold": 50,
     "enable_grammar_repair": True,
     "grammar_repair_timeout": 45,
+    "enable_hybrid_grammar": True,
+    "enable_state_verification": True,
     "enable_parallel_tools": True,
     "max_parallel_workers": 4,
     "compress_threshold": 20,
@@ -227,34 +229,63 @@ def _build_repair_schema(tool_names: List[str]) -> Dict:
         "required": ["action"]
     }
 
+
+def _build_action_schema(tool_names: List[str]) -> Dict:
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["call_tool", "transition", "finish", "ask_user"]
+            },
+            "tool_name": {
+                "type": "string",
+                "enum": tool_names
+            },
+            "tool_args": {"type": "object"},
+            "next_state": {
+                "type": "string",
+                "enum": ["EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"]
+            },
+            "summary": {"type": "string"},
+            "question": {"type": "string"}
+        },
+        "required": ["action"]
+    }
+
 # ═══════════════════════════════════════════════════════
 # BASE TOOL SCHEMAS
 # ═══════════════════════════════════════════════════════
 
 BASE_TOOLS: List[Dict] = [
-    {"name": "ask_user",       "schema": "<ask_user>\n<question>Your question</question>\n</ask_user>",                                         "description": "Ask the user a clarifying question. Execution pauses until they reply."},
-    {"name": "finish",         "schema": "<finish>\n<summary>Final answer or deliverable summary</summary>\n</finish>",                         "description": "Conclude the task with a final answer. Call this when done."},
-    {"name": "deep_research",   "schema": "<deep_research>\n<topic>topic to research</topic>\n</deep_research>",                                "description": "Autonomous multi-query deep web research. Generates sub-queries, scrapes high-signal pages with Trafilatura, synthesizes a complete Markdown report in workspace/, and syncs facts to memory."},
-    {"name": "search_web",     "schema": "<search_web>\n<query>search query</query>\n</search_web>",                                            "description": "Resilient multi-engine web search. Returns titles, URLs, and clean snippets."},
-    {"name": "read_url",       "schema": "<read_url>\n<url>URL to fetch</url>\n</read_url>",                                                    "description": "Fetch and extract readable text from a URL using Trafilatura (preserves tables and formatting)."},
-    {"name": "execute_python", "schema": "<execute_python>\n# python code\n</execute_python>",                                                  "description": "Run Python in a sandboxed subprocess. CWD is workspace/."},
-    {"name": "run_command",    "schema": "<run_command>\nbash command\n</run_command>",                                                          "description": "Run a bash command on macOS."},
-    {"name": "read_file",      "schema": "<read_file>\n<path>file path</path>\n</read_file>",                                                   "description": "Read a local file (up to 6,000 chars)."},
-    {"name": "write_file",     "schema": "<write_file>\n<path>path</path>\n<content>content</content>\n</write_file>",                         "description": "Write text to a file. Creates dirs. Overwrites if exists."},
-    {"name": "append_file",    "schema": "<append_file>\n<path>path</path>\n<content>content</content>\n</append_file>",                       "description": "Append text to a file without overwriting it."},
-    {"name": "open_file",      "schema": "<open_file>\n<path>file path</path>\n</open_file>",                                                   "description": "Open a file in its native macOS app (Excel, Preview, etc.)."},
-    {"name": "open_url",       "schema": "<open_url>\n<url>URL</url>\n</open_url>",                                                             "description": "Open a URL in the default macOS browser."},
-    {"name": "notify_user",    "schema": "<notify_user>\n<title>title</title>\n<message>message</message>\n</notify_user>",                    "description": "Show a native macOS notification banner."},
-    {"name": "list_directory", "schema": "<list_directory>\n<path>directory path</path>\n</list_directory>",                                    "description": "List files and subdirectories with sizes."},
-    {"name": "get_clipboard",  "schema": "<get_clipboard></get_clipboard>",                                                                       "description": "Read the current macOS clipboard."},
-    {"name": "set_clipboard",  "schema": "<set_clipboard>\n<text>text to copy</text>\n</set_clipboard>",                                       "description": "Write text to the macOS clipboard."},
-    {"name": "run_apple_script","schema": "<run_apple_script>\nAppleScript code here\n</run_apple_script>",                                    "description": "Execute arbitrary AppleScript on macOS."},
-    {"name": "create_note",    "schema": "<create_note>\n<title>Note title</title>\n<content>Body lines</content>\n</create_note>",            "description": "Create an Apple Note with title and bullets."},
-    {"name": "sleep",          "schema": "<sleep>\n<seconds>N</seconds>\n</sleep>",                                                             "description": "Wait N seconds (use only when polling external processes)."},
-    {"name": "read_memory",    "schema": "<read_memory></read_memory>",                                                                           "description": "Read all persistent semantic memory."},
-    {"name": "write_memory",   "schema": "<write_memory>\n<key>key</key>\n<value>value</value>\n</write_memory>",                             "description": "Save a key-value fact to persistent memory."},
-    {"name": "search_memory",  "schema": "<search_memory>\n<query>query</query>\n</search_memory>",                                            "description": "Search semantic memory for a substring."},
-    {"name": "read_episodic",  "schema": "<read_episodic></read_episodic>",                                                                       "description": "Read past task summaries from episodic memory."},
+    {"name": "ask_user",               "schema": "<ask_user>\n<question>Your question</question>\n</ask_user>",                                         "description": "Ask the user a clarifying question. Execution pauses until they reply."},
+    {"name": "finish",                 "schema": "<finish>\n<summary>Final answer or deliverable summary</summary>\n</finish>",                         "description": "Conclude the task with a final answer. Call this when done."},
+    {"name": "deep_research",          "schema": "<deep_research>\n<topic>topic to research</topic>\n</deep_research>",                                "description": "Autonomous multi-query deep web research. Generates sub-queries, scrapes high-signal pages with Trafilatura, synthesizes a complete Markdown report in workspace/, and syncs facts to memory."},
+    {"name": "search_web",             "schema": "<search_web>\n<query>search query</query>\n</search_web>",                                            "description": "Resilient multi-engine web search. Returns titles, URLs, and clean snippets."},
+    {"name": "read_url",               "schema": "<read_url>\n<url>URL to fetch</url>\n</read_url>",                                                    "description": "Fetch and extract readable text from a URL using Trafilatura (preserves tables and formatting)."},
+    {"name": "set_display_brightness", "schema": "<set_display_brightness>\n<level>0.0 to 1.0 (or 0-100)</level>\n</set_display_brightness>",         "description": "Set hardware screen brightness (0.0 to 1.0 or 0-100%). Native DisplayServices C-bindings. Returns verified values."},
+    {"name": "get_display_brightness", "schema": "<get_display_brightness></get_display_brightness>",                                                 "description": "Read exact hardware screen brightness via DisplayServices C-bindings. Returns percentage and float."},
+    {"name": "set_system_volume",     "schema": "<set_system_volume>\n<level>0 to 100</level>\n</set_system_volume>",                                 "description": "Set macOS system audio output volume (0 to 100). Returns verified output."},
+    {"name": "get_system_volume",     "schema": "<get_system_volume></get_system_volume>",                                                             "description": "Read current macOS system audio output volume (0 to 100)."},
+    {"name": "get_system_state",      "schema": "<get_system_state></get_system_state>",                                                              "description": "Read unified macOS hardware state: display brightness, audio volume, battery, frontmost app."},
+    {"name": "execute_python",         "schema": "<execute_python>\n# python code\n</execute_python>",                                                  "description": "Run Python in a sandboxed subprocess. CWD is workspace/."},
+    {"name": "run_command",            "schema": "<run_command>\nbash command\n</run_command>",                                                          "description": "Run a bash command on macOS."},
+    {"name": "read_file",              "schema": "<read_file>\n<path>file path</path>\n</read_file>",                                                   "description": "Read a local file (up to 6,000 chars)."},
+    {"name": "write_file",             "schema": "<write_file>\n<path>path</path>\n<content>content</content>\n</write_file>",                         "description": "Write text to a file. Creates dirs. Overwrites if exists."},
+    {"name": "append_file",            "schema": "<append_file>\n<path>path</path>\n<content>content</content>\n</append_file>",                       "description": "Append text to a file without overwriting it."},
+    {"name": "open_file",              "schema": "<open_file>\n<path>file path</path>\n</open_file>",                                                   "description": "Open a file in its native macOS app (Excel, Preview, etc.)."},
+    {"name": "open_url",               "schema": "<open_url>\n<url>URL</url>\n</open_url>",                                                             "description": "Open a URL in the default macOS browser."},
+    {"name": "notify_user",            "schema": "<notify_user>\n<title>title</title>\n<message>message</message>\n</notify_user>",                    "description": "Show a native macOS notification banner."},
+    {"name": "list_directory",         "schema": "<list_directory>\n<path>directory path</path>\n</list_directory>",                                    "description": "List files and subdirectories with sizes."},
+    {"name": "get_clipboard",          "schema": "<get_clipboard></get_clipboard>",                                                                       "description": "Read the current macOS clipboard."},
+    {"name": "set_clipboard",          "schema": "<set_clipboard>\n<text>text to copy</text>\n</set_clipboard>",                                       "description": "Write text to the macOS clipboard."},
+    {"name": "run_apple_script",        "schema": "<run_apple_script>\nAppleScript code here\n</run_apple_script>",                                    "description": "Execute arbitrary AppleScript on macOS."},
+    {"name": "create_note",            "schema": "<create_note>\n<title>Note title</title>\n<content>Body lines</content>\n</create_note>",            "description": "Create an Apple Note with title and bullets."},
+    {"name": "sleep",                  "schema": "<sleep>\n<seconds>N</seconds>\n</sleep>",                                                             "description": "Wait N seconds (use only when polling external processes)."},
+    {"name": "read_memory",            "schema": "<read_memory></read_memory>",                                                                           "description": "Read all persistent semantic memory."},
+    {"name": "write_memory",           "schema": "<write_memory>\n<key>key</key>\n<value>value</value>\n</write_memory>",                             "description": "Save a key-value fact to persistent memory."},
+    {"name": "search_memory",          "schema": "<search_memory>\n<query>query</query>\n</search_memory>",                                            "description": "Search semantic memory for a substring."},
+    {"name": "read_episodic",          "schema": "<read_episodic></read_episodic>",                                                                       "description": "Read past task summaries from episodic memory."},
 ]
 
 # ═══════════════════════════════════════════════════════
@@ -544,6 +575,107 @@ def create_note_fn(title: str, content: str) -> str:
                'end tell\nend tell')
     result = run_apple_script_fn(script)
     return f'Apple Note created: "{title}"' if "error" not in result.lower() else result
+
+
+# ═══════════════════════════════════════════════════════
+# NATIVE MACOS GROUND-TRUTH CONTROLS (CoreGraphics & Audio)
+# ═══════════════════════════════════════════════════════
+
+def get_display_brightness_fn() -> str:
+    try:
+        ds = ctypes.CDLL('/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices')
+        get_b = ds.DisplayServicesGetBrightness
+        get_b.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+        get_b.restype = ctypes.c_int
+        val = ctypes.c_float()
+        res = get_b(1, ctypes.byref(val))
+        if res == 0:
+            pct = round(val.value * 100)
+            return f"Display brightness: {pct}% ({val.value:.3f})"
+    except Exception as e:
+        logger.error(f"DisplayServices read error: {e}")
+    try:
+        r = subprocess.run(["brightness", "-l"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return "Display brightness could not be determined."
+
+
+def set_display_brightness_fn(level: Any) -> str:
+    try:
+        if isinstance(level, dict):
+            level = level.get("level") or level.get("brightness_level") or level.get("brightness") or level.get("value") or 1.0
+        val = float(str(level).strip().rstrip("%"))
+        if val > 1.0:
+            val = val / 100.0
+        val = max(0.0, min(1.0, val))
+
+        before = get_display_brightness_fn()
+        ds = ctypes.CDLL('/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices')
+        set_b = ds.DisplayServicesSetBrightness
+        set_b.argtypes = [ctypes.c_uint32, ctypes.c_float]
+        set_b.restype = ctypes.c_int
+        res = set_b(1, ctypes.c_float(val))
+
+        after = get_display_brightness_fn()
+        if res == 0:
+            return f"Display brightness successfully updated.\nPrevious: {before}\nCurrent: {after} (Target: {round(val*100)}%)"
+        return f"DisplayServices set failed with code {res}."
+    except Exception as e:
+        return f"Failed to set display brightness: {e}"
+
+
+def get_system_volume_fn() -> str:
+    try:
+        r = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return f"System audio volume: {r.stdout.strip()}%"
+    except Exception as e:
+        return f"Volume read error: {e}"
+    return "Could not determine system volume."
+
+
+def set_system_volume_fn(level: Any) -> str:
+    try:
+        if isinstance(level, dict):
+            level = level.get("level") or level.get("volume_level") or level.get("volume") or level.get("value") or 50
+        val = int(float(str(level).strip().rstrip("%")))
+        val = max(0, min(100, val))
+        before = get_system_volume_fn()
+        subprocess.run(["osascript", "-e", f"set volume output volume {val}"], check=True, timeout=5)
+        after = get_system_volume_fn()
+        return f"System audio volume successfully updated.\nPrevious: {before}\nCurrent: {after} (Target: {val}%)"
+    except Exception as e:
+        return f"Failed to set audio volume: {e}"
+
+
+def get_system_state_fn() -> str:
+    parts = []
+    parts.append(f"• {get_display_brightness_fn()}")
+    parts.append(f"• {get_system_volume_fn()}")
+    try:
+        r = subprocess.run(["osascript", "-e", 'tell application "System Events" to name of first process whose frontmost is true'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            parts.append(f"• Frontmost App: {r.stdout.strip()}")
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            lines = [l.strip() for l in r.stdout.split("\n") if ";" in l]
+            if lines:
+                parts.append(f"• Battery: {lines[0]}")
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            parts.append(f"• macOS: {r.stdout.strip()}")
+    except Exception:
+        pass
+    return "macOS System State:\n" + "\n".join(parts)
 
 
 def _search_ddgs_primary(query: str, max_results: int) -> List[Dict[str, str]]:
@@ -1096,9 +1228,10 @@ _POSITIONAL_MAP: Dict[str, str] = {
     "search_web": "query", "read_url": "url", "read_file": "path", "list_directory": "path",
     "sleep": "seconds", "search_memory": "query", "ask_user": "question",
     "open_file": "path", "open_url": "url", "set_clipboard": "text", "finish": "summary",
+    "set_display_brightness": "level", "set_system_volume": "level",
 }
 _SKIP_TAGS = {"transition", "scratchpad", "thought"}
-_NO_ARG_TOOLS = {"read_memory", "read_episodic", "get_clipboard"}
+_NO_ARG_TOOLS = {"read_memory", "read_episodic", "get_clipboard", "get_display_brightness", "get_system_volume", "get_system_state"}
 
 
 def extract_tool_calls(text: str) -> List[Tuple[str, Dict]]:
@@ -1132,29 +1265,38 @@ def extract_tool_calls(text: str) -> List[Tuple[str, Dict]]:
 
 def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
     ROUTES = {
-        "ask_user":          lambda: ask_user_fn(args.get("question", "")),
-        "finish":            lambda: finish_fn(args.get("summary", "")),
-        "deep_research":     lambda: deep_research_fn(args.get("topic", "")),
-        "open_file":         lambda: open_file_fn(args.get("path", "")),
-        "open_url":          lambda: open_url_fn(args.get("url", "")),
-        "notify_user":       lambda: notify_user_fn(args.get("title", "AutoAgent"), args.get("message", "Done.")),
-        "search_web":        lambda: search_web_fn(args.get("query", "")),
-        "read_url":          lambda: read_url_fn(args.get("url", "")),
-        "execute_python":    lambda: execute_python_sandboxed(args.get("code", "")),
-        "run_command":       lambda: run_command_fn(args.get("command", "")),
-        "read_file":         lambda: read_file_fn(args.get("path", "")),
-        "write_file":        lambda: write_file_fn(args.get("path", ""), args.get("content", "")),
-        "append_file":       lambda: append_file_fn(args.get("path", ""), args.get("content", "")),
-        "list_directory":    lambda: list_dir_fn(args.get("path", ".")),
-        "get_clipboard":     lambda: get_clipboard_fn(),
-        "set_clipboard":     lambda: set_clipboard_fn(args.get("text", "")),
-        "run_apple_script":  lambda: run_apple_script_fn(args.get("script", "")),
-        "create_note":       lambda: create_note_fn(args.get("title", "Note"), args.get("content", "")),
-        "sleep":             lambda: sleep_fn(int(args.get("seconds", 5))),
-        "read_memory":       lambda: read_memory_fn(),
-        "write_memory":      lambda: write_memory_fn(args.get("key", ""), args.get("value", "")),
-        "search_memory":     lambda: search_memory_fn(args.get("query", "")),
-        "read_episodic":     lambda: read_episodic_fn(),
+        "ask_user":               lambda: ask_user_fn(args.get("question", "")),
+        "finish":                 lambda: finish_fn(args.get("summary", "")),
+        "deep_research":          lambda: deep_research_fn(args.get("topic", "")),
+        "open_file":              lambda: open_file_fn(args.get("path", "")),
+        "open_url":               lambda: open_url_fn(args.get("url", "")),
+        "notify_user":            lambda: notify_user_fn(args.get("title", "AutoAgent"), args.get("message", "Done.")),
+        "search_web":             lambda: search_web_fn(args.get("query", "")),
+        "read_url":               lambda: read_url_fn(args.get("url", "")),
+        "execute_python":         lambda: execute_python_sandboxed(args.get("code", "")),
+        "run_command":            lambda: run_command_fn(args.get("command", "")),
+        "read_file":              lambda: read_file_fn(args.get("path", "")),
+        "write_file":             lambda: write_file_fn(args.get("path", ""), args.get("content", "")),
+        "append_file":            lambda: append_file_fn(args.get("path", ""), args.get("content", "")),
+        "list_directory":         lambda: list_dir_fn(args.get("path", ".")),
+        "get_clipboard":          lambda: get_clipboard_fn(),
+        "set_clipboard":          lambda: set_clipboard_fn(args.get("text", "")),
+        "run_apple_script":       lambda: run_apple_script_fn(args.get("script", "")),
+        "create_note":            lambda: create_note_fn(args.get("title", "Note"), args.get("content", "")),
+        "sleep":                  lambda: sleep_fn(int(args.get("seconds", 5))),
+        "read_memory":            lambda: read_memory_fn(),
+        "write_memory":           lambda: write_memory_fn(args.get("key", ""), args.get("value", "")),
+        "search_memory":          lambda: search_memory_fn(args.get("query", "")),
+        "read_episodic":          lambda: read_episodic_fn(),
+        "set_display_brightness": lambda: set_display_brightness_fn(
+            args.get("level") or args.get("brightness_level") or args.get("brightness") or args.get("value") or (args if not isinstance(args, dict) else 1.0)
+        ),
+        "get_display_brightness": lambda: get_display_brightness_fn(),
+        "set_system_volume":      lambda: set_system_volume_fn(
+            args.get("level") or args.get("volume_level") or args.get("volume") or args.get("value") or (args if not isinstance(args, dict) else 50)
+        ),
+        "get_system_volume":      lambda: get_system_volume_fn(),
+        "get_system_state":       lambda: get_system_state_fn(),
     }
     if tool_name in ROUTES:
         res = ROUTES[tool_name]()
@@ -1182,7 +1324,7 @@ def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
 _SEQUENTIAL_TOOLS = {
     "deep_research", "write_file", "append_file", "write_memory", "run_command", "execute_python",
     "open_file", "open_url", "notify_user", "ask_user", "finish", "set_clipboard",
-    "run_apple_script", "create_note", "sleep"
+    "run_apple_script", "create_note", "sleep", "set_display_brightness", "set_system_volume"
 }
 
 
@@ -1274,6 +1416,17 @@ def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
     tool_sig_counts: Counter = Counter()
     recent_tools: deque = deque(maxlen=8)
 
+    # Ground-Truth Closed-Loop State Verification Tracker
+    target_mutation = None
+    u_lower = user_input.lower()
+    if any(k in u_lower for k in ("brightness", "display", "screen brightness", "dim screen", "brighten")):
+        target_mutation = "brightness"
+    elif any(k in u_lower for k in ("volume", "sound", "mute", "unmute", "audio")):
+        target_mutation = "volume"
+    elif any(k in u_lower for k in ("write file", "save file", "create file", "save to", "write to file")):
+        target_mutation = "file"
+    has_verified_mutation = False
+
     current_plugins = get_dynamic_plugins()
     available_tool_names = [t["name"] for t in BASE_TOOLS] + list(current_plugins.keys())
 
@@ -1320,50 +1473,107 @@ def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
         messages.append({"role": "assistant", "content": full_reply})
 
         transition_match = re.search(r'<transition>(.*?)</transition>', full_reply, re.IGNORECASE)
-        tool_calls = extract_tool_calls(full_reply)
+        raw_tool_calls = extract_tool_calls(full_reply)
 
-        # Finish tool check
-        finish_call = next(((t, a) for t, a in tool_calls if t == "finish"), None)
-        if finish_call:
-            summary = finish_call[1].get("summary", "")
-            console.print(Panel(Markdown(summary), title="[bold green]Task Complete[/bold green]", border_style="green"))
-            notify_user_fn("AutoAgent", "Task complete!")
-            break
+        current_plugins = get_dynamic_plugins()
+        available_tool_names = [t["name"] for t in BASE_TOOLS] + list(current_plugins.keys())
 
-        # No tool calls and no transition
+        # Validate extracted tools against registered names
+        tool_calls = []
+        for name, args in raw_tool_calls:
+            if name in available_tool_names:
+                tool_calls.append((name, args))
+            else:
+                console.print(f"[dim yellow]Model invoked unregistered tool '{name}', falling back to grammar dispatch...[/dim yellow]")
+
+        # Phase 2: Hybrid Grammar Action Dispatch (Logit-Masked JSON Schema)
         if not tool_calls and not transition_match:
             clean_reply = re.sub(r'<thought>.*?</thought>', '', full_reply, flags=re.DOTALL).strip()
 
-            # Try grammar repair
-            if CONFIG.get("enable_grammar_repair", True):
-                repaired = repair_tool_dispatch(full_reply, available_tool_names, messages)
-                if repaired:
-                    rname, rargs = repaired
-                    if rname == "__transition__":
-                        new_state = rargs.get("state", current_state)
-                        console.print(f"[magenta]Grammar-repaired transition -> {new_state}[/magenta]")
-                        current_state = new_state
-                        if current_state == "DONE":
-                            break
-                        continue
-                    else:
-                        tool_calls = [(rname, rargs)]
+            if CONFIG.get("enable_hybrid_grammar", True) or CONFIG.get("enable_grammar_repair", True):
+                schema = _build_action_schema(available_tool_names)
+                dispatch_msgs = [
+                    {"role": "system", "content": (
+                        "You are a deterministic action dispatcher. Given the conversation context and the agent's latest thought, "
+                        "emit the EXACT structured JSON action matching the schema.\n"
+                        "Choose action: 'call_tool' (must provide valid tool_name from enum, and tool_args), 'transition' (next_state), 'finish' (summary), or 'ask_user' (question)."
+                    )},
+                    {"role": "user", "content": (
+                        f"User Task: {user_input}\n"
+                        f"Agent Thought / Reasoning:\n{full_reply[-1000:]}\n\n"
+                        f"Available tools: {available_tool_names}\n"
+                        "Dispatch the next action now."
+                    )}
+                ]
+                try:
+                    resp = chat_ollama_blocking(dispatch_msgs, temperature=0.0, format_schema=schema,
+                                                timeout=CONFIG.get("grammar_repair_timeout", 35))
+                    data = json.loads(resp.get("content", "{}"))
+                    action = data.get("action", "respond")
+                    if action == "call_tool":
+                        t_name = data.get("tool_name")
+                        t_args = data.get("tool_args") or {}
+                        if t_name and t_name in available_tool_names:
+                            console.print(f"[magenta]Hybrid grammar dispatched tool -> {t_name}[/magenta]")
+                            tool_calls = [(t_name, t_args)]
+                    elif action == "transition":
+                        t_state = data.get("next_state", current_state)
+                        if t_state in ("EVALUATE", "RESEARCH", "SYNTHESIS", "ACTION", "DONE"):
+                            console.print(f"[magenta]Hybrid grammar transition -> {t_state}[/magenta]")
+                            current_state = t_state
+                            if current_state != "DONE":
+                                continue
+                            transition_match = re.search(r'DONE', 'DONE')
+                    elif action == "finish":
+                        tool_calls = [("finish", {"summary": data.get("summary", "Task complete.")})]
+                    elif action == "ask_user":
+                        tool_calls = [("ask_user", {"question": data.get("question", "")})]
+                except Exception as e:
+                    console.print(f"[dim red]Hybrid grammar dispatch failed: {e}[/dim red]")
+
+            if not tool_calls and not transition_match:
+                if clean_reply and current_state in ("ACTION", "SYNTHESIS", "EVALUATE") and step > 1:
+                    console.print(Panel(Markdown(clean_reply), title="[green]Response[/green]", border_style="green"))
+                    break
                 else:
-                    if clean_reply and current_state in ("ACTION", "SYNTHESIS", "EVALUATE") and step > 1:
-                        console.print(Panel(Markdown(clean_reply), title="[green]Response[/green]", border_style="green"))
-                        break
-                    else:
-                        messages.append({"role": "user", "content":
-                            "SYSTEM: No tool call or transition detected. Use <tool_name>...</tool_name> "
-                            "to call a tool, <transition>STATE</transition> to change state, or "
-                            "<finish><summary>...</summary></finish> to conclude."})
-                        continue
+                    messages.append({"role": "user", "content":
+                        "SYSTEM: No tool call or transition detected. Use <tool_name>...</tool_name> "
+                        "to call a tool, <transition>STATE</transition> to change state, or "
+                        "<finish><summary>...</summary></finish> to conclude."})
+                    continue
 
         if tool_calls and transition_match:
             transition_match = None  # tools take priority
 
-        current_plugins = get_dynamic_plugins()
-        available_tool_names = [t["name"] for t in BASE_TOOLS] + list(current_plugins.keys())
+        # Closed-Loop State Verification Gate
+        finish_call = next(((t, a) for t, a in tool_calls if t == "finish"), None)
+        wants_finish = bool(finish_call) or (transition_match and transition_match.group(1).strip().upper() == "DONE")
+
+        if wants_finish:
+            if CONFIG.get("enable_state_verification", True) and target_mutation and not has_verified_mutation:
+                inspection_tool = {
+                    "brightness": "get_display_brightness",
+                    "volume": "get_system_volume",
+                    "file": "read_file"
+                }.get(target_mutation, "get_system_state")
+                console.print(Panel(
+                    f"[bold red]VERIFICATION INTERCEPTOR TRIGGERED[/bold red]\n"
+                    f"Agent attempted to conclude, but target mutation [bold cyan]{target_mutation}[/bold cyan] was not empirically verified!\n"
+                    f"Enforcing inspection via [bold green]{inspection_tool}[/bold green]...",
+                    border_style="red"
+                ))
+                messages.append({"role": "system", "content": (
+                    f"[SYSTEM VERIFICATION REQUIRED]: You attempted to conclude the task, but the physical state for '{target_mutation}' "
+                    f"has NOT been verified by an inspection tool! You MUST call <{inspection_tool}></{inspection_tool}> "
+                    f"now to confirm the state before concluding."
+                )})
+                continue
+
+            if finish_call:
+                summary = finish_call[1].get("summary", "")
+                console.print(Panel(Markdown(summary), title="[bold green]Task Complete[/bold green]", border_style="green"))
+                notify_user_fn("AutoAgent", "Task complete!")
+                break
 
         if transition_match and not tool_calls:
             new_state = transition_match.group(1).strip().upper()
@@ -1444,6 +1654,22 @@ def state_machine_loop(user_input: str, messages: List[Dict]) -> List[Dict]:
                 logger.tool_call(t_name, tool_calls[i][1], t_result, t_dur)
                 preview = t_result[:1200] + (f"\n[{len(t_result):,} chars total]" if len(t_result) > 1200 else "")
                 console.print(Panel(f"[green]Observation ({t_dur:.2f}s)[/green]\n\n{preview}", border_style="green"))
+
+                # State verification tracking
+                res_lower = t_result.lower()
+                is_success = "error" not in res_lower and "failed" not in res_lower and "timed out" not in res_lower
+                if target_mutation == "brightness" and t_name in ("set_display_brightness", "get_display_brightness"):
+                    if is_success:
+                        has_verified_mutation = True
+                        console.print("[dim green]✓ Verified brightness hardware state.[/dim green]")
+                elif target_mutation == "volume" and t_name in ("set_system_volume", "get_system_volume"):
+                    if is_success:
+                        has_verified_mutation = True
+                        console.print("[dim green]✓ Verified volume audio state.[/dim green]")
+                elif target_mutation == "file" and t_name in ("write_file", "append_file", "read_file"):
+                    if is_success:
+                        has_verified_mutation = True
+                        console.print("[dim green]✓ Verified file system state.[/dim green]")
 
                 if t_result.startswith("TASK_COMPLETED:"):
                     break_loop = True

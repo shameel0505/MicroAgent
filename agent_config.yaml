@@ -30,8 +30,10 @@ intent_use_grammar: true
 enable_planning: true
 planning_threshold: 50
 
-# ── Grammar Guardrails ──────────────────────────────────
+# ── Grammar Guardrails & Verification ───────────────────
 enable_grammar_repair: true
+enable_hybrid_grammar: true      # logit-masked schema dispatch for guaranteed tool syntax
+enable_state_verification: true  # closed-loop inspection before finish to eliminate hallucinations
 
 # ── Parallel Execution ──────────────────────────────────
 enable_parallel_tools: true

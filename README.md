@@ -1,4 +1,4 @@
-# 🔬 MicroAgent: Local ReAct Autonomous Agent Runtime (v5.0)
+# 🔬 MicroAgent: Local ReAct Autonomous Agent Runtime (v5.1)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -7,18 +7,20 @@
 
 A high-performance, local-first autonomous agent engine designed specifically to maximize task execution reliability on **small-parameter local models (7B - 9B)** like `qwen2.5-coder:7b` running on Apple Silicon.
 
-### 🌟 What's New in v5.0:
+### 🌟 What's New in v5.1:
+- **Two-Phase Hybrid Grammar Execution (`enable_hybrid_grammar`):** Unconstrained Chain-of-Thought (`<thought>`) live-streaming for deep reasoning, followed immediately by logit-masked JSON schema dispatch (`_build_action_schema`) to eliminate syntax and tag hallucinations while keeping reasoning sharp.
+- **Closed-Loop Ground-Truth Verification Gate (`enable_state_verification`):** Intercepts premature task conclusion (`<finish>`) whenever a physical mutation was requested (e.g., brightness, volume, file write) but not empirically verified by an inspection tool. Cures hallucinated completions.
+- **Native macOS Hardware Controls:**
+  - `set_display_brightness` / `get_display_brightness`: Native `ctypes` bindings to macOS PrivateFramework `DisplayServices.framework` (`DisplayServicesSetBrightness` / `DisplayServicesGetBrightness`).
+  - `set_system_volume` / `get_system_volume`: Native CoreAudio/AppleScript volume control with verified state return.
+  - `get_system_state`: Unified system telemetry (display brightness, audio volume, battery status, frontmost application).
 - **Autonomous Deep Research Engine (`deep_research` / `/research`):** Decomposes topics into orthogonal sub-queries, executes concurrent multi-engine searches, scrapes high-signal pages with Trafilatura, and synthesizes publication-grade Markdown research deliverables in `workspace/`.
 - **Resilient Multi-Engine Search:** Eliminates rate-limit dead ends with automatic fallback chaining: Primary DDGS $\rightarrow$ DuckDuckGo HTML Lite $\rightarrow$ Tavily/Brave APIs.
 - **Trafilatura SOTA Content Extraction:** Distills main body articles, preserves structural Markdown tables, and discards cookie notices, navigation menus, and web clutter.
 - **Self-Healing Diagnostic Reflex:** When execution tools fail with macOS/script error codes (e.g., AppleScript `-1728`), AutoAgent automatically queries resilient search to identify modern fixes and prevent loop hallucinations.
-- **Grammar Guardrails:** Ollama JSON schema logit-masking repairs tool dispatch when models omit XML tags.
 - **Parallel Tool Execution:** Read-only operations (`deep_research`, `search_web`, `read_url`, `read_file`, etc.) execute concurrently via `ThreadPoolExecutor`.
 - **2-Tier Intent Classification:** Instant keyword fast-path + grammar LLM classifier for zero-latency chat vs. task routing.
 - **Session Persistence:** Save and restore full conversations and execution history across restarts (`/session`).
-- **macOS Workstation Native:** Native clipboard integration (`get_clipboard`, `set_clipboard`), AppleScript execution (`run_apple_script`), and Apple Notes creation (`create_note`).
-- **Memory Auto-Injection:** Semantic memory automatically injected into system prompts for persistent contextual awareness.
-- **Tool Deduplication & Safety:** Eliminates duplicate calls in a single turn and enforces loop-breaking heuristics.
 
 ---
 
