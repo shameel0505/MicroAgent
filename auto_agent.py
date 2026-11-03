@@ -768,21 +768,22 @@ def _search_bing_lite(query: str, max_results: int) -> List[Dict[str, str]]:
 
 
 def _search_wikipedia(query: str, max_results: int = 2) -> List[Dict[str, str]]:
-    """Instant ground-truth encyclopedic definitions via Wikipedia OpenSearch REST API."""
-    url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(query)}&limit={max_results}&namespace=0&format=json"
+    """Instant ground-truth encyclopedic definitions via Wikipedia Full-Text Search API."""
+    url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query)}&srlimit={max_results}&format=json"
     headers = {"User-Agent": "MicroAgent/5.2 (https://github.com/shameel0505/MicroAgent; research@agent.local)"}
     try:
-        r = requests.get(url, headers=headers, timeout=CONFIG["web_timeout"]).json()
-        titles = r[1]
-        descs = r[2]
-        urls = r[3]
+        data = requests.get(url, headers=headers, timeout=CONFIG["web_timeout"]).json()
+        search_items = data.get("query", {}).get("search", [])
         results = []
-        for t, d, u in zip(titles, descs, urls):
-            snippet = d.strip() if d else f"Encyclopedic reference and specifications for {t}."
-            results.append({"title": f"Wikipedia: {t}", "href": u, "body": snippet})
+        for item in search_items:
+            title = item.get("title", "")
+            snippet = re.sub(r'<[^>]+>', '', item.get("snippet", "")).strip()
+            page_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+            results.append({"title": f"Wikipedia: {title}", "href": page_url, "body": snippet})
         return results
     except Exception:
         return []
+
 
 
 def _search_ddgs_primary(query: str, max_results: int) -> List[Dict[str, str]]:
@@ -885,20 +886,20 @@ def search_web_fn(query: str, max_results: Optional[int] = None) -> str:
             except Exception:
                 pass
 
-    # 3. Federated Native Fallback: Bing Lite + DDGS + Wikipedia
-    if len(results) < n:
-        bing_res = _search_bing_lite(query, n)
-        _add_results(bing_res)
-
+    # 3. Federated Native Fallback: DDGS -> Wikipedia -> Bing Lite -> DDG HTML
     if len(results) < n:
         ddg_res = _search_ddgs_primary(query, n)
         _add_results(ddg_res)
 
-    if not results:
-        _add_results(_search_ddg_html_fallback(query, n))
+    if len(results) < n:
+        _add_results(_search_wikipedia(query, min(3, n)))
 
     if len(results) < n:
-        _add_results(_search_wikipedia(query, 2))
+        bing_res = _search_bing_lite(query, n)
+        _add_results(bing_res)
+
+    if not results:
+        _add_results(_search_ddg_html_fallback(query, n))
 
     if not results:
         return f"No search results found for: {query}"
