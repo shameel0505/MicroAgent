@@ -16,14 +16,14 @@ What's new:
   * Thread-safe logger
 """
 
-import os, sys, json, re, time, subprocess, importlib.util, select, hashlib, threading, ctypes
+import os, sys, json, re, time, subprocess, importlib.util, select, hashlib, threading, ctypes, urllib.parse, base64
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import requests, asyncio
 from bs4 import BeautifulSoup
 
 try:
@@ -39,6 +39,14 @@ try:
     HAS_TRAFILATURA = True
 except ImportError:
     HAS_TRAFILATURA = False
+
+try:
+    os.environ["CRAWL4AI_NO_CLOUD_NOTICE"] = "1"
+    import crawl4ai
+    from crawl4ai import AsyncWebCrawler
+    HAS_CRAWL4AI = True
+except ImportError:
+    HAS_CRAWL4AI = False
 
 from rich.console import Console
 from rich.panel import Panel
@@ -85,13 +93,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "enable_smart_compress": True,
     "search_max_results": 5,
     "search_engine": "auto",
+    "searxng_url": "http://localhost:8080",
+    "enable_searxng": True,
+    "enable_crawl4ai": True,
     "deep_research_max_queries": 4,
     "deep_research_max_pages": 5,
     "enable_diagnostic_research": True,
     "tavily_api_key": "",
     "brave_api_key": "",
     "file_read_limit": 6000,
-    "url_read_limit": 4000,
+    "url_read_limit": 5000,
     "observation_limit": 3000,
     "offload_large_obs": True,
     "max_steps": 30,
@@ -678,6 +689,102 @@ def get_system_state_fn() -> str:
     return "macOS System State:\n" + "\n".join(parts)
 
 
+# ═══════════════════════════════════════════════════════
+# RESILIENT WEB SEARCH & EXTRACTION (SearXNG + Crawl4AI)
+# ═══════════════════════════════════════════════════════
+
+def _search_searxng(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Local SearXNG metasearch aggregator (Google + Bing + DuckDuckGo + Wikipedia)."""
+    if not CONFIG.get("enable_searxng", True):
+        return []
+    url = f"{CONFIG.get('searxng_url', 'http://localhost:8080')}/search"
+    params = {"q": query, "format": "json"}
+    try:
+        resp = requests.get(url, params=params, timeout=CONFIG.get("web_timeout", 10))
+        if resp.status_code == 200:
+            data = resp.json()
+            results = []
+            for r in data.get("results", []):
+                href = r.get("url", "")
+                title = r.get("title", "")
+                snippet = r.get("content", "")
+                if href and title:
+                    results.append({"title": title, "href": href, "body": snippet})
+                if len(results) >= max_results:
+                    break
+            return results
+    except Exception:
+        pass
+    return []
+
+
+def _unwrap_bing_url(url: str) -> str:
+    """Decodes Bing's redirect &u=a1... parameter to get direct destination URLs."""
+    if "bing.com/ck/a" in url and "&u=" in url:
+        try:
+            parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            u_val = parsed.get("u", [""])[0]
+            if u_val.startswith("a1"):
+                raw_b64 = u_val[2:]
+                padded = raw_b64 + "=" * (-len(raw_b64) % 4)
+                decoded = base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
+                if decoded.startswith("http"):
+                    return decoded
+        except Exception:
+            pass
+    return url
+
+
+def _search_bing_lite(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Fast, rich-snippet Bing HTML search without rate-limits or JS dependencies."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=CONFIG["web_timeout"])
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for li in soup.find_all("li", class_="b_algo"):
+            h2 = li.find("h2")
+            a = h2.find("a") if h2 else None
+            p = li.find("p")
+            if a and a.get("href"):
+                raw_href = a["href"]
+                clean_href = _unwrap_bing_url(raw_href)
+                title = a.get_text(strip=True)
+                snippet = p.get_text(strip=True) if p else ""
+                if clean_href.startswith("http") and not any(r["href"] == clean_href for r in results):
+                    results.append({"title": title, "href": clean_href, "body": snippet})
+                if len(results) >= max_results:
+                    break
+        return results
+    except Exception:
+        return []
+
+
+def _search_wikipedia(query: str, max_results: int = 2) -> List[Dict[str, str]]:
+    """Instant ground-truth encyclopedic definitions via Wikipedia OpenSearch REST API."""
+    url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(query)}&limit={max_results}&namespace=0&format=json"
+    headers = {"User-Agent": "MicroAgent/5.2 (https://github.com/shameel0505/MicroAgent; research@agent.local)"}
+    try:
+        r = requests.get(url, headers=headers, timeout=CONFIG["web_timeout"]).json()
+        titles = r[1]
+        descs = r[2]
+        urls = r[3]
+        results = []
+        for t, d, u in zip(titles, descs, urls):
+            snippet = d.strip() if d else f"Encyclopedic reference and specifications for {t}."
+            results.append({"title": f"Wikipedia: {t}", "href": u, "body": snippet})
+        return results
+    except Exception:
+        return []
+
+
 def _search_ddgs_primary(query: str, max_results: int) -> List[Dict[str, str]]:
     if not DDGS:
         return []
@@ -702,7 +809,6 @@ def _search_ddg_html_fallback(query: str, max_results: int) -> List[Dict[str, st
             return []
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-        import urllib.parse
         for div in soup.find_all("div", class_="result"):
             title_a = div.find("a", class_="result__a")
             snippet_a = div.find("a", class_="result__snippet")
@@ -748,55 +854,94 @@ def _search_brave(query: str, max_results: int, api_key: str) -> List[Dict[str, 
 def search_web_fn(query: str, max_results: Optional[int] = None) -> str:
     n = max_results or CONFIG["search_max_results"]
     results: List[Dict[str, str]] = []
+    seen_urls: set = set()
 
-    # 1. Check Tavily or Brave if configured
-    tavily_key = CONFIG.get("tavily_api_key") or os.environ.get("TAVILY_API_KEY")
-    if tavily_key:
-        try:
-            results = _search_tavily(query, n, tavily_key)
-        except Exception:
-            pass
+    def _add_results(new_list: List[Dict[str, str]]):
+        for r in new_list:
+            href = r.get("href", "")
+            if href and href not in seen_urls:
+                seen_urls.add(href)
+                results.append(r)
 
-    brave_key = CONFIG.get("brave_api_key") or os.environ.get("BRAVE_API_KEY")
-    if not results and brave_key:
-        try:
-            results = _search_brave(query, n, brave_key)
-        except Exception:
-            pass
+    # 1. Primary: Local SearXNG Meta-Search Aggregator (Google + Bing + DDG + Wiki)
+    if CONFIG.get("enable_searxng", True):
+        searx_res = _search_searxng(query, n)
+        if searx_res:
+            _add_results(searx_res)
 
-    # 2. Primary DuckDuckGo
+    # 2. Check Tavily or Brave if configured
+    if len(results) < n:
+        tavily_key = CONFIG.get("tavily_api_key") or os.environ.get("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                _add_results(_search_tavily(query, n, tavily_key))
+            except Exception:
+                pass
+
+        brave_key = CONFIG.get("brave_api_key") or os.environ.get("BRAVE_API_KEY")
+        if not results and brave_key:
+            try:
+                _add_results(_search_brave(query, n, brave_key))
+            except Exception:
+                pass
+
+    # 3. Federated Native Fallback: Bing Lite + DDGS + Wikipedia
+    if len(results) < n:
+        bing_res = _search_bing_lite(query, n)
+        _add_results(bing_res)
+
+    if len(results) < n:
+        ddg_res = _search_ddgs_primary(query, n)
+        _add_results(ddg_res)
+
     if not results:
-        results = _search_ddgs_primary(query, n)
+        _add_results(_search_ddg_html_fallback(query, n))
 
-    # 3. Resilient HTML Fallback
-    if not results:
-        results = _search_ddg_html_fallback(query, n)
+    if len(results) < n:
+        _add_results(_search_wikipedia(query, 2))
 
     if not results:
         return f"No search results found for: {query}"
 
     lines = [f"Search: {query}\n"]
-    for i, r in enumerate(results, 1):
+    for i, r in enumerate(results[:n], 1):
         snippet = (r.get("body", "") or "")[:280].replace("\n", " ")
         lines.append(f"{i}. {r.get('title', 'No title')}\n   URL: {r.get('href', '')}\n   Snippet: {snippet}\n")
     return "\n".join(lines).strip()
 
 
+def _crawl4ai_extract(url: str) -> Optional[str]:
+    """Crawl4AI asynchronous browser extraction wrapped synchronously."""
+    if not HAS_CRAWL4AI:
+        return None
+    try:
+        async def _run():
+            async with AsyncWebCrawler(verbose=False) as crawler:
+                res = await crawler.arun(url=url)
+                if res.success and res.markdown:
+                    return res.markdown.strip()
+            return None
+        return asyncio.run(_run())
+    except Exception as e:
+        logger.error(f"Crawl4AI extraction error for {url}: {e}")
+        return None
+
+
 def read_url_fn(url: str) -> str:
     limit = CONFIG["url_read_limit"]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+    # 1. Trafilatura SOTA Extraction (Instant HTTP + Tables)
+    raw_html = ""
     try:
         resp = requests.get(url, headers=headers, timeout=CONFIG["web_timeout"])
-        resp.raise_for_status()
-        raw_html = resp.text
-
-        # 1. Trafilatura SOTA Extraction (Markdown + Tables)
-        if HAS_TRAFILATURA:
-            try:
+        if resp.status_code == 200:
+            raw_html = resp.text
+            if HAS_TRAFILATURA:
                 extracted = trafilatura.extract(
                     raw_html,
                     output_format="markdown",
@@ -809,33 +954,46 @@ def read_url_fn(url: str) -> str:
                     if len(clean_text) > limit:
                         clean_text = clean_text[:limit] + f"\n\n[truncated at {limit:,} chars]"
                     return clean_text
-            except Exception:
-                pass
+    except Exception:
+        pass
 
-        # 2. BeautifulSoup Smart Fallback
-        soup = BeautifulSoup(raw_html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript", "svg", "form"]):
-            tag.decompose()
-        main = soup.find("main") or soup.find("article") or soup.find(id=re.compile(r"content|main|article", re.I)) or soup.body
-        text = (main or soup).get_text(separator="\n", strip=True)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        if len(text) > limit:
-            text = text[:limit] + f"\n\n[truncated at {limit:,} chars]"
-        return text or "(empty page content)"
-    except requests.HTTPError as e:
-        return f"HTTP {e.response.status_code}: {url}"
-    except Exception as e:
-        return f"URL read error: {e}"
+    # 2. Crawl4AI Deep Browser Extraction (for JS-rendered pages & Cloudflare blocks)
+    if CONFIG.get("enable_crawl4ai", True) and HAS_CRAWL4AI:
+        try:
+            c4ai_md = _crawl4ai_extract(url)
+            if c4ai_md and len(c4ai_md) > 80:
+                if len(c4ai_md) > limit:
+                    c4ai_md = c4ai_md[:limit] + f"\n\n[truncated at {limit:,} chars]"
+                return c4ai_md
+        except Exception:
+            pass
+
+    # 3. BeautifulSoup Smart Fallback
+    if raw_html:
+        try:
+            soup = BeautifulSoup(raw_html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript", "svg", "form"]):
+                tag.decompose()
+            main = soup.find("main") or soup.find("article") or soup.find(id=re.compile(r"content|main|article", re.I)) or soup.body
+            text = (main or soup).get_text(separator="\n", strip=True)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            if len(text) > limit:
+                text = text[:limit] + f"\n\n[truncated at {limit:,} chars]"
+            return text or "(empty page content)"
+        except Exception as e:
+            return f"HTML parse error: {e}"
+
+    return f"Failed to retrieve URL content: {url}"
 
 
 def deep_research_fn(topic: str, depth: str = "standard") -> str:
     """
-    Autonomous multi-query deep research engine:
-    1. Sub-query generation (breadth expansion)
-    2. Concurrent search across engines
-    3. Trafilatura-powered concurrent extraction
-    4. Synthesis into publication-grade Markdown report
-    5. Saves deliverable to workspace/ & records key facts to memory
+    Autonomous multi-query deep research engine (SearXNG + Crawl4AI + Trafilatura):
+    1. Sub-query generation across orthogonal angles.
+    2. Concurrent search across SearXNG and federated engines.
+    3. Crawl4AI / Trafilatura concurrent extraction.
+    4. Synthesis into publication-grade Markdown report.
+    5. Saves deliverable to workspace/ & records key facts to memory.
     """
     console.print(Panel(f"[bold cyan]Launching Deep Research:[/bold cyan] {topic}", border_style="cyan"))
     t0 = time.time()
@@ -890,7 +1048,6 @@ def deep_research_fn(topic: str, depth: str = "standard") -> str:
         for fut in as_completed(future_map):
             for u in fut.result():
                 try:
-                    import urllib.parse
                     domain = urllib.parse.urlparse(u).netloc
                     if domain and domain not in seen_domains:
                         seen_domains.add(domain)
@@ -899,7 +1056,7 @@ def deep_research_fn(topic: str, depth: str = "standard") -> str:
                     pass
 
     target_urls = collected_urls[:CONFIG.get("deep_research_max_pages", 5)]
-    console.print(f"[dim]Scraping {len(target_urls)} high-signal sources concurrently via Trafilatura...[/dim]")
+    console.print(f"[dim]Scraping {len(target_urls)} high-signal sources concurrently via Crawl4AI & Trafilatura...[/dim]")
 
     # Step 3: Concurrent Scraping
     source_texts = []
@@ -909,7 +1066,7 @@ def deep_research_fn(topic: str, depth: str = "standard") -> str:
             u = future_scrapes[fut]
             try:
                 content = fut.result()
-                if content and len(content) > 100 and "HTTP" not in content[:15]:
+                if content and len(content) > 100 and "HTTP" not in content[:15] and "Failed to" not in content[:15]:
                     source_texts.append(f"### Source: {u}\n{content[:2500]}\n")
             except Exception:
                 pass

@@ -1,4 +1,4 @@
-# 🔬 MicroAgent: Local ReAct Autonomous Agent Runtime (v5.1)
+# 🔬 MicroAgent: Local ReAct Autonomous Agent Runtime (v5.2)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -7,16 +7,17 @@
 
 A high-performance, local-first autonomous agent engine designed specifically to maximize task execution reliability on **small-parameter local models (7B - 9B)** like `qwen2.5-coder:7b` running on Apple Silicon.
 
-### 🌟 What's New in v5.1:
+### 🌟 What's New in v5.2:
+- **Zero-Key Local Metasearch Engine via SearXNG (`enable_searxng`):** Integrates local SearXNG (`http://localhost:8080`) pulling structured JSON across Google, Bing, DuckDuckGo, Brave, and Wikipedia with zero commercial API keys and zero rate-limits.
+- **Deep Markdown & Table Web Extraction via Crawl4AI + Trafilatura (`enable_crawl4ai`):** Crawl4AI (30,000+ ⭐) asynchronous crawler paired with Trafilatura for lightning-fast distillation of raw web pages into clean, token-dense Markdown tables and text optimized for local LLM attention windows.
+- **Resilient Multi-Engine Fallback Pipeline:** Eliminates search downtime with zero external dependencies when SearXNG is offline: SearXNG $\rightarrow$ Bing Lite $\rightarrow$ DuckDuckGo HTML Lite $\rightarrow$ Wikipedia OpenSearch API.
 - **Two-Phase Hybrid Grammar Execution (`enable_hybrid_grammar`):** Unconstrained Chain-of-Thought (`<thought>`) live-streaming for deep reasoning, followed immediately by logit-masked JSON schema dispatch (`_build_action_schema`) to eliminate syntax and tag hallucinations while keeping reasoning sharp.
 - **Closed-Loop Ground-Truth Verification Gate (`enable_state_verification`):** Intercepts premature task conclusion (`<finish>`) whenever a physical mutation was requested (e.g., brightness, volume, file write) but not empirically verified by an inspection tool. Cures hallucinated completions.
 - **Native macOS Hardware Controls:**
   - `set_display_brightness` / `get_display_brightness`: Native `ctypes` bindings to macOS PrivateFramework `DisplayServices.framework` (`DisplayServicesSetBrightness` / `DisplayServicesGetBrightness`).
   - `set_system_volume` / `get_system_volume`: Native CoreAudio/AppleScript volume control with verified state return.
   - `get_system_state`: Unified system telemetry (display brightness, audio volume, battery status, frontmost application).
-- **Autonomous Deep Research Engine (`deep_research` / `/research`):** Decomposes topics into orthogonal sub-queries, executes concurrent multi-engine searches, scrapes high-signal pages with Trafilatura, and synthesizes publication-grade Markdown research deliverables in `workspace/`.
-- **Resilient Multi-Engine Search:** Eliminates rate-limit dead ends with automatic fallback chaining: Primary DDGS $\rightarrow$ DuckDuckGo HTML Lite $\rightarrow$ Tavily/Brave APIs.
-- **Trafilatura SOTA Content Extraction:** Distills main body articles, preserves structural Markdown tables, and discards cookie notices, navigation menus, and web clutter.
+- **Autonomous Deep Research Engine (`deep_research` / `/research`):** Decomposes topics into orthogonal sub-queries, executes concurrent multi-engine searches, extracts clean content via Crawl4AI/Trafilatura, and synthesizes publication-grade Markdown research deliverables in `workspace/`.
 - **Self-Healing Diagnostic Reflex:** When execution tools fail with macOS/script error codes (e.g., AppleScript `-1728`), AutoAgent automatically queries resilient search to identify modern fixes and prevent loop hallucinations.
 - **Parallel Tool Execution:** Read-only operations (`deep_research`, `search_web`, `read_url`, `read_file`, etc.) execute concurrently via `ThreadPoolExecutor`.
 - **2-Tier Intent Classification:** Instant keyword fast-path + grammar LLM classifier for zero-latency chat vs. task routing.
@@ -125,7 +126,14 @@ source venv/bin/activate  # On Windows: .\venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Launch Agent
+### 3. (Recommended) Launch Local SearXNG Metasearch
+For aggregated multi-engine search across Google, Bing, DuckDuckGo, Brave, and Wikipedia with zero API keys:
+```bash
+docker run -d -p 8080:8080 --name searxng -v "$PWD/searxng":/etc/searxng searxng/searxng:latest
+```
+*(If Docker is not active, MicroAgent automatically and seamlessly falls back to native Python Bing Lite + DuckDuckGo HTML + Wikipedia OpenSearch).*
+
+### 4. Launch Agent
 ```bash
 python auto_agent.py
 ```

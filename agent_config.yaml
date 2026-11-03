@@ -48,14 +48,17 @@ enable_smart_compress: true
 
 # ── Search & Deep Research ──────────────────────────────
 search_max_results: 5        # fewer results = less token noise
-search_engine: auto           # auto (ddgs -> ddg_html -> tavily/brave)
+search_engine: auto           # auto (searxng -> bing_lite -> ddg_html -> wikipedia)
+searxng_url: http://localhost:8080 # local SearXNG metasearch aggregator
+enable_searxng: true          # enable zero-key local metasearch
+enable_crawl4ai: true         # enable Crawl4AI deep markdown extractor
 deep_research_max_queries: 4  # sub-queries per research run
-deep_research_max_pages: 5    # max pages to scrape concurrently via Trafilatura
+deep_research_max_pages: 5    # max pages to scrape concurrently via Crawl4AI/Trafilatura
 enable_diagnostic_research: true # auto-research on system/tool errors
 tavily_api_key: ""            # optional: Tavily API key
 brave_api_key: ""             # optional: Brave Search API key
 file_read_limit: 6000        # generous but not overwhelming
-url_read_limit: 5000         # clean Trafilatura markdown limit
+url_read_limit: 5000         # clean Crawl4AI/Trafilatura markdown limit
 
 # ── Observation offloading ─────────────────────────────
 # Large tool outputs are saved to workspace/ and a short pointer
