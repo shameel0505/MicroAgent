@@ -27,12 +27,18 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 except ImportError:
     try:
-        from ddgs import DDGS
+        from duckduckgo_search import DDGS
     except ImportError:
         DDGS = None
+
+try:
+    import trafilatura
+    HAS_TRAFILATURA = True
+except ImportError:
+    HAS_TRAFILATURA = False
 
 from rich.console import Console
 from rich.panel import Panel
@@ -76,6 +82,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "keep_recent": 8,
     "enable_smart_compress": True,
     "search_max_results": 5,
+    "search_engine": "auto",
+    "deep_research_max_queries": 4,
+    "deep_research_max_pages": 5,
+    "enable_diagnostic_research": True,
+    "tavily_api_key": "",
+    "brave_api_key": "",
     "file_read_limit": 6000,
     "url_read_limit": 4000,
     "observation_limit": 3000,
@@ -158,10 +170,19 @@ Your current working directory is: {WORKSPACE_DIR}
 
 [STATES]
 EVALUATE  -> Analyse the task. Plan next move. Transition to RESEARCH or ACTION.
-RESEARCH  -> Gather facts: search_web, read_url, read_file.
+RESEARCH  -> Gather facts: deep_research, search_web, read_url, read_file.
 SYNTHESIS -> Consolidate research in <scratchpad>...</scratchpad>, then transition to ACTION.
 ACTION    -> Build deliverables: execute_python, write_file, run_command, open_file.
 DONE      -> Task complete. Call <finish>.
+
+[MACOS SYSTEM AUTOMATION (Sonoma / Sequoia / Ventura)]
+- macOS 13+ replaced "System Preferences" with "System Settings".
+- Display Settings Pane: 'com.apple.Displays-Settings.extension'
+- Sound Settings Pane: 'com.apple.Sound-Settings.extension'
+- Network Settings Pane: 'com.apple.Network-Settings.extension'
+- Screen Brightness: Use CLI 'brightness <value>' (0.0 to 1.0) or native CoreGraphics, rather than GUI scripting.
+- Volume: 'osascript -e "set volume output volume <0-100>"'
+- Always prefer reliable CLI commands over GUI AppleScript clicking whenever possible.
 
 [FINISH IMMEDIATELY when]
 - Task is answerable from your own knowledge
@@ -213,8 +234,9 @@ def _build_repair_schema(tool_names: List[str]) -> Dict:
 BASE_TOOLS: List[Dict] = [
     {"name": "ask_user",       "schema": "<ask_user>\n<question>Your question</question>\n</ask_user>",                                         "description": "Ask the user a clarifying question. Execution pauses until they reply."},
     {"name": "finish",         "schema": "<finish>\n<summary>Final answer or deliverable summary</summary>\n</finish>",                         "description": "Conclude the task with a final answer. Call this when done."},
-    {"name": "search_web",     "schema": "<search_web>\n<query>search query</query>\n</search_web>",                                            "description": "DuckDuckGo web search. Returns titles, URLs, snippets."},
-    {"name": "read_url",       "schema": "<read_url>\n<url>URL to fetch</url>\n</read_url>",                                                    "description": "Fetch and extract readable text from a URL."},
+    {"name": "deep_research",   "schema": "<deep_research>\n<topic>topic to research</topic>\n</deep_research>",                                "description": "Autonomous multi-query deep web research. Generates sub-queries, scrapes high-signal pages with Trafilatura, synthesizes a complete Markdown report in workspace/, and syncs facts to memory."},
+    {"name": "search_web",     "schema": "<search_web>\n<query>search query</query>\n</search_web>",                                            "description": "Resilient multi-engine web search. Returns titles, URLs, and clean snippets."},
+    {"name": "read_url",       "schema": "<read_url>\n<url>URL to fetch</url>\n</read_url>",                                                    "description": "Fetch and extract readable text from a URL using Trafilatura (preserves tables and formatting)."},
     {"name": "execute_python", "schema": "<execute_python>\n# python code\n</execute_python>",                                                  "description": "Run Python in a sandboxed subprocess. CWD is workspace/."},
     {"name": "run_command",    "schema": "<run_command>\nbash command\n</run_command>",                                                          "description": "Run a bash command on macOS."},
     {"name": "read_file",      "schema": "<read_file>\n<path>file path</path>\n</read_file>",                                                   "description": "Read a local file (up to 6,000 chars)."},
@@ -524,38 +546,302 @@ def create_note_fn(title: str, content: str) -> str:
     return f'Apple Note created: "{title}"' if "error" not in result.lower() else result
 
 
-def search_web_fn(query: str) -> str:
+def _search_ddgs_primary(query: str, max_results: int) -> List[Dict[str, str]]:
+    if not DDGS:
+        return []
     try:
-        if not DDGS:
-            return "DuckDuckGo search library not available."
-        results = DDGS().text(query, max_results=CONFIG["search_max_results"])
-        if not results:
-            return "No results found."
-        lines = [f"Search: {query}\n"]
-        for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r.get('title', 'No title')}\n   {r.get('href', '')}\n   {r.get('body', '')[:260]}\n")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Search error: {e}"
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            return [{"title": r.get("title", ""), "href": r.get("href", ""), "body": r.get("body", "")}
+                    for r in results if r.get("href")]
+    except Exception:
+        return []
+
+
+def _search_ddg_html_fallback(query: str, max_results: int) -> List[Dict[str, str]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = requests.post("https://html.duckduckgo.com/html/", data={"q": query}, headers=headers, timeout=CONFIG["web_timeout"])
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        import urllib.parse
+        for div in soup.find_all("div", class_="result"):
+            title_a = div.find("a", class_="result__a")
+            snippet_a = div.find("a", class_="result__snippet")
+            if title_a and title_a.get("href"):
+                raw_href = title_a["href"]
+                if "uddg=" in raw_href:
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
+                    clean_url = parsed.get("uddg", [raw_href])[0]
+                else:
+                    clean_url = raw_href
+                title = title_a.get_text(strip=True)
+                snippet = snippet_a.get_text(strip=True) if snippet_a else ""
+                if clean_url.startswith("http") and not any(r["href"] == clean_url for r in results):
+                    results.append({"title": title, "href": clean_url, "body": snippet})
+                if len(results) >= max_results:
+                    break
+        return results
+    except Exception:
+        return []
+
+
+def _search_tavily(query: str, max_results: int, api_key: str) -> List[Dict[str, str]]:
+    url = "https://api.tavily.com/search"
+    resp = requests.post(url, json={"api_key": api_key, "query": query, "max_results": max_results}, timeout=CONFIG["web_timeout"])
+    if resp.status_code == 200:
+        data = resp.json()
+        return [{"title": r.get("title", ""), "href": r.get("url", ""), "body": r.get("content", "")}
+                for r in data.get("results", [])]
+    return []
+
+
+def _search_brave(query: str, max_results: int, api_key: str) -> List[Dict[str, str]]:
+    url = "https://api.search.brave.com/res/v1/web/search"
+    headers = {"Accept": "application/json", "X-Subscription-Token": api_key}
+    resp = requests.get(url, params={"q": query, "count": max_results}, headers=headers, timeout=CONFIG["web_timeout"])
+    if resp.status_code == 200:
+        data = resp.json()
+        return [{"title": r.get("title", ""), "href": r.get("url", ""), "body": r.get("description", "")}
+                for r in data.get("web", {}).get("results", [])]
+    return []
+
+
+def search_web_fn(query: str, max_results: Optional[int] = None) -> str:
+    n = max_results or CONFIG["search_max_results"]
+    results: List[Dict[str, str]] = []
+
+    # 1. Check Tavily or Brave if configured
+    tavily_key = CONFIG.get("tavily_api_key") or os.environ.get("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            results = _search_tavily(query, n, tavily_key)
+        except Exception:
+            pass
+
+    brave_key = CONFIG.get("brave_api_key") or os.environ.get("BRAVE_API_KEY")
+    if not results and brave_key:
+        try:
+            results = _search_brave(query, n, brave_key)
+        except Exception:
+            pass
+
+    # 2. Primary DuckDuckGo
+    if not results:
+        results = _search_ddgs_primary(query, n)
+
+    # 3. Resilient HTML Fallback
+    if not results:
+        results = _search_ddg_html_fallback(query, n)
+
+    if not results:
+        return f"No search results found for: {query}"
+
+    lines = [f"Search: {query}\n"]
+    for i, r in enumerate(results, 1):
+        snippet = (r.get("body", "") or "")[:280].replace("\n", " ")
+        lines.append(f"{i}. {r.get('title', 'No title')}\n   URL: {r.get('href', '')}\n   Snippet: {snippet}\n")
+    return "\n".join(lines).strip()
 
 
 def read_url_fn(url: str) -> str:
+    limit = CONFIG["url_read_limit"]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
         resp = requests.get(url, headers=headers, timeout=CONFIG["web_timeout"])
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
+        raw_html = resp.text
+
+        # 1. Trafilatura SOTA Extraction (Markdown + Tables)
+        if HAS_TRAFILATURA:
+            try:
+                extracted = trafilatura.extract(
+                    raw_html,
+                    output_format="markdown",
+                    include_tables=True,
+                    include_formatting=True,
+                    favor_precision=True
+                )
+                if extracted and len(extracted.strip()) > 80 and "enable javascript" not in extracted.lower()[:200]:
+                    clean_text = extracted.strip()
+                    if len(clean_text) > limit:
+                        clean_text = clean_text[:limit] + f"\n\n[truncated at {limit:,} chars]"
+                    return clean_text
+            except Exception:
+                pass
+
+        # 2. BeautifulSoup Smart Fallback
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript", "svg", "form"]):
             tag.decompose()
-        main = soup.find("main") or soup.find("article") or soup.body
+        main = soup.find("main") or soup.find("article") or soup.find(id=re.compile(r"content|main|article", re.I)) or soup.body
         text = (main or soup).get_text(separator="\n", strip=True)
         text = re.sub(r"\n{3,}", "\n\n", text)
-        limit = CONFIG["url_read_limit"]
-        return text[:limit] + (f"\n[truncated at {limit:,} chars]" if len(text) > limit else "")
+        if len(text) > limit:
+            text = text[:limit] + f"\n\n[truncated at {limit:,} chars]"
+        return text or "(empty page content)"
     except requests.HTTPError as e:
         return f"HTTP {e.response.status_code}: {url}"
     except Exception as e:
         return f"URL read error: {e}"
+
+
+def deep_research_fn(topic: str, depth: str = "standard") -> str:
+    """
+    Autonomous multi-query deep research engine:
+    1. Sub-query generation (breadth expansion)
+    2. Concurrent search across engines
+    3. Trafilatura-powered concurrent extraction
+    4. Synthesis into publication-grade Markdown report
+    5. Saves deliverable to workspace/ & records key facts to memory
+    """
+    console.print(Panel(f"[bold cyan]Launching Deep Research:[/bold cyan] {topic}", border_style="cyan"))
+    t0 = time.time()
+
+    # Step 1: Sub-Query Generation
+    max_queries = CONFIG.get("deep_research_max_queries", 4)
+    query_prompt = [
+        {"role": "system", "content": (
+            "You are a master research planner. Decompose the research topic into 3-4 distinct, "
+            "highly targeted web search queries covering specifications, practical implementation/commands, "
+            "and best practices. Output ONLY valid JSON in this exact schema:\n"
+            '{"queries": ["query 1", "query 2", "query 3"]}'
+        )},
+        {"role": "user", "content": f"Topic: {topic}"}
+    ]
+    sub_queries = [topic]
+    try:
+        resp = chat_ollama_blocking(query_prompt, temperature=0.2, format_schema={
+            "type": "object",
+            "properties": {"queries": {"type": "array", "items": {"type": "string"}}},
+            "required": ["queries"]
+        }, timeout=25)
+        parsed = json.loads(resp.get("content", "{}"))
+        if parsed.get("queries"):
+            sub_queries = parsed["queries"][:max_queries]
+    except Exception:
+        sub_queries = [
+            f"{topic} overview specifications",
+            f"{topic} macos commands implementation",
+            f"{topic} best practices guide",
+            f"{topic} troubleshooting gotchas"
+        ][:max_queries]
+
+    console.print(f"[dim]Generated {len(sub_queries)} targeted search queries...[/dim]")
+
+    # Step 2: Parallel Search
+    collected_urls: List[str] = []
+    seen_domains: set = set()
+
+    def _run_search(q: str) -> List[str]:
+        try:
+            res_text = search_web_fn(q, max_results=3)
+            found = []
+            for m in re.finditer(r'URL:\s*(https?://[^\s\n]+)', res_text):
+                found.append(m.group(1))
+            return found
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=min(4, len(sub_queries))) as exc:
+        future_map = {exc.submit(_run_search, q): q for q in sub_queries}
+        for fut in as_completed(future_map):
+            for u in fut.result():
+                try:
+                    import urllib.parse
+                    domain = urllib.parse.urlparse(u).netloc
+                    if domain and domain not in seen_domains:
+                        seen_domains.add(domain)
+                        collected_urls.append(u)
+                except Exception:
+                    pass
+
+    target_urls = collected_urls[:CONFIG.get("deep_research_max_pages", 5)]
+    console.print(f"[dim]Scraping {len(target_urls)} high-signal sources concurrently via Trafilatura...[/dim]")
+
+    # Step 3: Concurrent Scraping
+    source_texts = []
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(target_urls)))) as exc:
+        future_scrapes = {exc.submit(read_url_fn, u): u for u in target_urls}
+        for fut in as_completed(future_scrapes):
+            u = future_scrapes[fut]
+            try:
+                content = fut.result()
+                if content and len(content) > 100 and "HTTP" not in content[:15]:
+                    source_texts.append(f"### Source: {u}\n{content[:2500]}\n")
+            except Exception:
+                pass
+
+    if not source_texts:
+        return f"Deep research could not retrieve valid content for: {topic}"
+
+    # Step 4: Synthesis into Comprehensive Markdown Report
+    console.print("[dim]Synthesizing comprehensive research report...[/dim]")
+    combined_notes = "\n\n---\n\n".join(source_texts[:4])
+    synthesis_prompt = [
+        {"role": "system", "content": (
+            "You are an elite research analyst. Given scraped source texts on a topic, synthesize "
+            "a publication-grade, comprehensive Markdown research report. Structure with:\n"
+            "# Title\n"
+            "## Executive Summary (3-4 bullet points)\n"
+            "## Core Findings & Technical Details\n"
+            "## Commands / Code / Action Plan\n"
+            "## Gotchas, Caveats & Edge Cases\n"
+            "## References (bulleted list of source URLs)\n"
+            "Be precise, objective, and dense with actionable facts. Do not write filler."
+        )},
+        {"role": "user", "content": f"Research Topic: {topic}\n\nGathered Sources:\n{combined_notes}"}
+    ]
+    resp = chat_ollama_blocking(synthesis_prompt, temperature=0.1, timeout=90)
+    report_content = resp.get("content", "").strip()
+
+    # Step 5: Save to Workspace & Sync Memory
+    slug = re.sub(r'[^a-zA-Z0-9]+', '_', topic.lower()).strip('_')[:30]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"research_{timestamp}_{slug}.md"
+    file_path = f"workspace/{filename}"
+    write_file_fn(file_path, report_content)
+
+    memory_summary = f"Deep Research on '{topic}': Saved to {file_path}. Sources: {', '.join(target_urls[:3])}"
+    write_memory_fn(f"research_{slug}", memory_summary)
+
+    dur = time.time() - t0
+    console.print(Panel(f"[green]Research completed in {dur:.1f}s[/green]\nDeliverable: [bold]{file_path}[/bold]",
+                        title="[bold green]Deep Research Complete[/bold green]", border_style="green"))
+
+    return f"DEEP RESEARCH DELIVERABLE GENERATED:\nFile: {file_path}\nSources Examined: {len(target_urls)}\n\n{report_content[:1500]}\n\n[Full report ({len(report_content):,} chars) saved to {file_path}]"
+
+
+def _diagnostic_lookup(failed_tool: str, error_msg: str, args: Dict) -> str:
+    """
+    Self-healing diagnostic reflex: when a system tool fails with an error code,
+    query resilient search to find the modern fix and prevent loop hallucinations.
+    """
+    if not CONFIG.get("enable_diagnostic_research", True):
+        return ""
+    clean_err = error_msg.replace("\n", " ").strip()
+    if len(clean_err) > 120:
+        clean_err = clean_err[:120]
+    query = f"fix macos {failed_tool} {clean_err}"
+    try:
+        search_res = search_web_fn(query, max_results=2)
+        if search_res and "No search results" not in search_res:
+            lines = [l.strip() for l in search_res.split("\n") if l.strip()]
+            snippets = " ".join(lines[1:5])[:280]
+            return f"\n\n[SELF-HEALING DIAGNOSTIC HINT]:\nTargeted search on this error found:\n{snippets}\n-> Do NOT repeat the exact same command. Correct the parameters or tool call."
+    except Exception:
+        pass
+    return ""
 
 
 def sleep_fn(seconds: int) -> str:
@@ -806,7 +1092,7 @@ def smart_compress(messages: List[Dict]) -> List[Dict]:
 # ═══════════════════════════════════════════════════════
 
 _POSITIONAL_MAP: Dict[str, str] = {
-    "execute_python": "code", "run_command": "command", "run_apple_script": "script",
+    "deep_research": "topic", "execute_python": "code", "run_command": "command", "run_apple_script": "script",
     "search_web": "query", "read_url": "url", "read_file": "path", "list_directory": "path",
     "sleep": "seconds", "search_memory": "query", "ask_user": "question",
     "open_file": "path", "open_url": "url", "set_clipboard": "text", "finish": "summary",
@@ -848,6 +1134,7 @@ def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
     ROUTES = {
         "ask_user":          lambda: ask_user_fn(args.get("question", "")),
         "finish":            lambda: finish_fn(args.get("summary", "")),
+        "deep_research":     lambda: deep_research_fn(args.get("topic", "")),
         "open_file":         lambda: open_file_fn(args.get("path", "")),
         "open_url":          lambda: open_url_fn(args.get("url", "")),
         "notify_user":       lambda: notify_user_fn(args.get("title", "AutoAgent"), args.get("message", "Done.")),
@@ -870,20 +1157,30 @@ def route_tool(tool_name: str, args: Dict, plugins: Dict) -> str:
         "read_episodic":     lambda: read_episodic_fn(),
     }
     if tool_name in ROUTES:
-        return ROUTES[tool_name]()
-    if tool_name in plugins:
+        res = ROUTES[tool_name]()
+    elif tool_name in plugins:
         try:
-            return str(plugins[tool_name].execute(args))
+            res = str(plugins[tool_name].execute(args))
         except Exception as e:
-            return f"Plugin error [{tool_name}]: {e}"
-    return f"Unknown tool '{tool_name}'. Available: {list(ROUTES) + list(plugins)}"
+            res = f"Plugin error [{tool_name}]: {e}"
+    else:
+        return f"Unknown tool '{tool_name}'. Available: {list(ROUTES) + list(plugins)}"
+
+    res_str = str(res)
+    if tool_name in ("run_command", "run_apple_script", "execute_python"):
+        err_lower = res_str.lower()
+        if any(k in err_lower for k in ("execution error", "error:", "syntaxerror", "can’t get pane id", "command not found", "timed out", "traceback")):
+            hint = _diagnostic_lookup(tool_name, res_str, args)
+            if hint:
+                res_str += hint
+    return res_str
 
 # ═══════════════════════════════════════════════════════
 # PARALLEL TOOL EXECUTION
 # ═══════════════════════════════════════════════════════
 
 _SEQUENTIAL_TOOLS = {
-    "write_file", "append_file", "write_memory", "run_command", "execute_python",
+    "deep_research", "write_file", "append_file", "write_memory", "run_command", "execute_python",
     "open_file", "open_url", "notify_user", "ask_user", "finish", "set_clipboard",
     "run_apple_script", "create_note", "sleep"
 }
@@ -1241,7 +1538,7 @@ def main() -> None:
         "[dim]Grammar Guardrails | Parallel Tools | Session Persistence | Intent AI[/dim]\n\n"
         f"Model: [green]{CONFIG['model']}[/green]  Context: [green]{CONFIG['context_size']:,}[/green] tokens  "
         f"Tools: [green]{len(BASE_TOOLS)} base + {plugin_count} plugins[/green]\n"
-        "Commands: [yellow]/help /plan /tools /memory /session /history /clear /exit[/yellow]",
+        "Commands: [yellow]/help /research /plan /tools /memory /session /history /clear /exit[/yellow]",
         border_style="cyan", title="AutoAgent"))
 
     system_content = _build_system_content(active_tools)
@@ -1311,6 +1608,18 @@ def main() -> None:
                 console.print(f"[dim]Total: {len(messages)} msgs | ~{context_tokens(messages):,} tokens[/dim]")
                 continue
 
+            if cmd.startswith("/research"):
+                topic_for_research = cmd[9:].strip()
+                if not topic_for_research:
+                    try:
+                        topic_for_research = input("Topic to research: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                if topic_for_research:
+                    report = deep_research_fn(topic_for_research)
+                    messages.append({"role": "system", "content": f"[DEEP RESEARCH COMPLETED]:\n{report}"})
+                continue
+
             if cmd.startswith("/plan"):
                 task_for_plan = cmd[5:].strip()
                 if not task_for_plan:
@@ -1328,6 +1637,7 @@ def main() -> None:
                 console.print(Panel(
                     "Chat naturally or give tasks. Slash commands:\n"
                     "  /tools    - list all tools\n"
+                    "  /research - autonomous multi-query deep research\n"
                     "  /plan     - generate task roadmap\n"
                     "  /memory   - view semantic memory\n"
                     "  /history  - view past tasks\n"

@@ -44,10 +44,16 @@ compress_threshold: 20
 keep_recent: 8               # fewer recent messages = less noise
 enable_smart_compress: true
 
-# ── Tool output limits ─────────────────────────────────
+# ── Search & Deep Research ──────────────────────────────
 search_max_results: 5        # fewer results = less token noise
+search_engine: auto           # auto (ddgs -> ddg_html -> tavily/brave)
+deep_research_max_queries: 4  # sub-queries per research run
+deep_research_max_pages: 5    # max pages to scrape concurrently via Trafilatura
+enable_diagnostic_research: true # auto-research on system/tool errors
+tavily_api_key: ""            # optional: Tavily API key
+brave_api_key: ""             # optional: Brave Search API key
 file_read_limit: 6000        # generous but not overwhelming
-url_read_limit: 4000         # small models get lost in long web pages
+url_read_limit: 5000         # clean Trafilatura markdown limit
 
 # ── Observation offloading ─────────────────────────────
 # Large tool outputs are saved to workspace/ and a short pointer

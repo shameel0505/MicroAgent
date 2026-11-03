@@ -8,8 +8,12 @@
 A high-performance, local-first autonomous agent engine designed specifically to maximize task execution reliability on **small-parameter local models (7B - 9B)** like `qwen2.5-coder:7b` running on Apple Silicon.
 
 ### 🌟 What's New in v5.0:
+- **Autonomous Deep Research Engine (`deep_research` / `/research`):** Decomposes topics into orthogonal sub-queries, executes concurrent multi-engine searches, scrapes high-signal pages with Trafilatura, and synthesizes publication-grade Markdown research deliverables in `workspace/`.
+- **Resilient Multi-Engine Search:** Eliminates rate-limit dead ends with automatic fallback chaining: Primary DDGS $\rightarrow$ DuckDuckGo HTML Lite $\rightarrow$ Tavily/Brave APIs.
+- **Trafilatura SOTA Content Extraction:** Distills main body articles, preserves structural Markdown tables, and discards cookie notices, navigation menus, and web clutter.
+- **Self-Healing Diagnostic Reflex:** When execution tools fail with macOS/script error codes (e.g., AppleScript `-1728`), AutoAgent automatically queries resilient search to identify modern fixes and prevent loop hallucinations.
 - **Grammar Guardrails:** Ollama JSON schema logit-masking repairs tool dispatch when models omit XML tags.
-- **Parallel Tool Execution:** Read-only operations (`search_web`, `read_url`, `read_file`, etc.) execute concurrently via `ThreadPoolExecutor`.
+- **Parallel Tool Execution:** Read-only operations (`deep_research`, `search_web`, `read_url`, `read_file`, etc.) execute concurrently via `ThreadPoolExecutor`.
 - **2-Tier Intent Classification:** Instant keyword fast-path + grammar LLM classifier for zero-latency chat vs. task routing.
 - **Session Persistence:** Save and restore full conversations and execution history across restarts (`/session`).
 - **macOS Workstation Native:** Native clipboard integration (`get_clipboard`, `set_clipboard`), AppleScript execution (`run_apple_script`), and Apple Notes creation (`create_note`).
